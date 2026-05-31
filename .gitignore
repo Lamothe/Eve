@@ -5,4 +5,8 @@ obj/
 checkpoints/
 generated.wav
 data/*.wav
+data/*.bin
 kokoro.onnx
+output/
+Eve.Native/build/
+lib/

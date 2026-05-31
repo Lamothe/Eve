@@ -13,12 +13,12 @@ Audio (float32) → Encoder → Vector Quantizer → Discrete Codes → Decoder 
 ```
 
 - **Encoder**: 4× downsampling via Conv1d (stride 2) + ResidualBlock(GELU), then project to latent dim
-- **Vector Quantizer**: Nearest-neighbor lookup into a learnable codebook. Standard VQ loss (MSE reconstruction + commitment loss with straight-through gradient estimator)
+- **Vector Quantizer**: Nearest-neighbor lookup into a learnable codebook. EMA codebook update with configurable decay (0.99), values clamped to ±5
 - **Decoder**: 4× upsampling via ConvTranspose1d (stride 2) + ResidualBlock(GELU), then project back to 1 channel
 - **Downsampling factor**: 2^4 = 16×. 24 kHz audio → 1500 tokens/sec
-- **Current defaults**: codebook=1024, latent_dim=64, ~1.2M params
+- **Current defaults**: codebook=256, latent_dim=64
 
-### Audio Transformer
+### Transformer
 
 Causal (decoder-only) transformer that predicts the next audio token.
 
@@ -26,109 +26,181 @@ Causal (decoder-only) transformer that predicts the next audio token.
 Codes → Embedding + PositionEncoding → TransformerEncoder(causal) → LayerNorm → Linear(vocab)
 ```
 
-- Uses TorchSharp's built-in `TransformerEncoderLayer` stacked via `TransformerEncoder`
-- Causal mask applied through the encoder's `src_mask` parameter
-- Autoregressive generation with temperature sampling
-- **Current defaults**: 512-dim, 8 heads, 6 layers, 2048 FFN, ~21M params
-
-### Training
-
-Two stages:
-
-1. **VQ-VAE** — reconstruction loss + commitment loss. Uses **EMA codebook update** (exponential moving average of encoder outputs per code) instead of gradient-based codebook training. Configurable decay (0.99) and commitment cost (0.25). Adam 1e-4, gradient clipping.
-2. **Transformer** — cross-entropy on next-code prediction. Adam 1e-4, gradient clipping. VQ-VAE frozen (eval mode). Codes pre-encoded in a `no_grad()` block.
-
-Both stages support per-epoch validation (configurable `ValSplit` ratio) and periodic checkpointing.
+- Built with **ggml/llama.cpp** native backend — runs on GPU via Vulkan
+- 512-dim embedding, 8 heads, 6 layers, 2048 FFN dim
+- Causal mask applied per-layer
+- AdamW optimizer with full backward pass on GPU
 
 ## Project Structure
 
 ```
 Eve/
-├── Eve.csproj              # .NET 10 project, TorchSharp 0.103.0
-├── Program.cs               # Entry point, training orchestration
+├── Eve.csproj                  # .NET 10 project, C# P/Invoke wrapper
+├── Program.cs                  # Entry point, CLI flags, 3-phase training pipeline
 ├── Utils/
-│   ├── Config.cs            # All hyperparameters in one place
-│   └── AudioIO.cs           # raw .wav read/write (no libsndfile dependency)
+│   ├── Config.cs               # Hyperparameters
+│   └── AudioIO.cs              # WAV read/write (pure C#, no native bindings)
 ├── Data/
-│   └── AudioDataset.cs      # Loads .wav, resamples, pads/crops to fixed length
-├── Models/
-│   ├── VQVAE.cs             # Encoder + VectorQuantizer + Decoder
-│   └── AudioTransformer.cs  # Causal transformer over audio token sequences
-├── Training/
-│   └── Trainer.cs           # Two-stage training loop
+│   ├── AudioDataset.cs         # Loads .wav files, zero-pads, serves batches
+│   └── SyntheticDataGenerator.cs # KokoroSharp-based synthetic audio generation
+├── Native/
+│   └── EveNative.cs            # C# P/Invoke wrapper for libeve_native.so
+├── Eve.Native/                 # Native library (C++ / ggml / Vulkan)
+│   ├── CMakeLists.txt
+│   └── src/
+│       └── eve_native.cpp      # Encoder, Decoder, Transformer, AdamW, Vulkan backend
+├── lib/                        # Built native libraries (gitignored)
+├── output/                     # Trained weights (gitignored)
+├── data/                       # Training audio (.wav, gitignored)
 └── README.md
 ```
 
 ## Running
 
-1. Put 24 kHz mono .wav files in `data/`
-2. `dotnet run`
-3. After training, `generated.wav` is produced (prompts from first file, generates 100 tokens)
+### Prerequisites
 
-Resume from checkpoint: `dotnet run -- --resume 10` (loads epoch 10 checkpoints from `checkpoints/`).
+- Linux with AMD GPU supporting Vulkan (RADV driver)
+- .NET 10 SDK
+- 24 kHz mono .wav files in `data/` (or generate them)
 
-**Current platform**: Linux x64, CPU-only (libtorch-cpu-linux-x64). Builds and runs on .NET 10.
+### Generate Training Data
 
-## Hardware Notes
-
-| Hardware | Use |
-|----------|-----|
-| Strix Halo 128 GB | Development, data preprocessing, CPU training of small models |
-| 4070 TI Super 16 GB | Real GPU training — add `TorchSharp-cuda-linux` package |
-
-Switch to CUDA:
-```xml
-<!-- Remove this -->
-<PackageReference Include="libtorch-cpu-linux-x64" Version="2.10.0" />
-<!-- Add this -->
-<PackageReference Include="TorchSharp-cuda-linux" Version="0.107.0" />
+```bash
+dotnet run -- --generate 100   # Generate 100 synthetic .wav files
 ```
+
+### Train (VQ-VAE + Transformer)
+
+```bash
+dotnet run                     # Full 3-phase pipeline
+```
+
+The training pipeline runs three phases:
+
+1. **Phase 0**: Encode all audio files → `data/codes.bin` (discrete token sequences)
+2. **Phase 1**: Train VQ-VAE (5000 steps, AdamW, GPU) — saves to `output/eve_vqvae_trained.bin`
+3. **Phase 2**: Train Transformer (10000 steps, AdamW, GPU) — saves to `output/eve_transformer_trained.bin`
+
+### Resume Training
+
+```bash
+dotnet run -- --resume         # Load existing weights, continue training
+```
+
+If existing weights are found in `output/`, training continues from there instead of starting from scratch.
+
+### Generate Audio
+
+```bash
+dotnet run -- --generate-audio 1500 0.9     # Generate from scratch, 1500 tokens, temp=0.9
+dotnet run -- --generate-audio 1500 0.9 prompt.wav  # Condition on prompt audio
+dotnet run -- --generate-audio 1500 0.9 prompt.wav output.wav  # Save to specific path
+```
+
+## CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--generate <N>` | Generate N synthetic .wav files (female voices, random prompts) |
+| `--generate-audio <tokens> <temp> [prompt.wav] [output.wav]` | Generate audio from trained model |
+| `--resume` | Continue training from existing weights in `output/` |
+| `--test-native` | Run P/Invoke wrapper tests |
+
+## Technology Stack
+
+| Component | Technology |
+|-----------|------------|
+| Language | C# / .NET 10 |
+| Native Backend | ggml/llama.cpp with Vulkan |
+| GPU Acceleration | AMD RADV (Strix Halo: RADV STRIX_HALO) |
+| Optimizer | AdamW (F32 precision) |
+| Audio I/O | Pure C# WAV reader/writer |
+
+## Current Status
+
+| Phase | Status | Time |
+|-------|--------|------|
+| Phase 0: Encoding | ✅ Working | ~16s for 246 files |
+| Phase 1: VQ-VAE Training | ✅ Working | ~47s (5000 steps) |
+| Phase 2: Transformer Training | ✅ Working | ~15min (10000 steps) |
+| Audio Generation | ✅ Working | ~1 token/sec |
+
+**Training results** (on 246 synthetic audio files):
+- VQ-VAE loss converged to ~0.02 after 5000 steps
+- Transformer loss dropped from ~8.3 (random) to ~5.55 after 10000 steps
+- Weights saved to `output/` directory (gitignored)
+
+## Hardware
+
+| Hardware | Platform |
+|----------|----------|
+| Strix Halo (AMD) | Primary dev platform — 128 GB RAM, RADV STRIX_HALO Vulkan |
+| NVIDIA CUDA | Not yet tested — would require CUDA backend in ggml |
+
+## How It Works
+
+### Tokenization (VQ-VAE)
+
+```
+Audio (24000 samples) → Encoder (4× Conv1d + ResBlocks) → [64-dim latent] → Quantize → Code index
+```
+
+Each 1-second audio clip produces ~1500 discrete code indices. The codebook maps each index back to a 64-dimensional vector, which the decoder reconstructs into audio.
+
+### Next-Token Prediction (Transformer)
+
+```
+[code0, code1, code2, ...] → Embedding + PosEnc → Transformer blocks → Logits → Sample next code
+```
+
+The Transformer autoregressively predicts the next code token given all previous codes. During generation, each step builds a forward graph for the full sequence (without KV-cache), samples the last position's logits with temperature, and appends the token.
+
+### Generation Pipeline
+
+```
+Prompt audio → VQ-VAE encode → initial codes → Transformer generate (N tokens) → Decode (VQ-VAE) → Output WAV
+```
+
+1. Encode prompt audio through VQ-VAE encoder to get initial codes
+2. Autoregressively generate N codes using the Transformer (temperature sampling)
+3. Decode the full code sequence through the VQ-VAE decoder
+4. Write reconstructed audio to WAV file
 
 ## What's Next
 
-### Known Limitations / Immediate Improvements
+### Immediate Improvements
 
-- **VQ-VAE uses single-level quantization** — no Residual Vector Quantization (RVQ). The `NumQuantizers` config exists but isn't wired. Multiple quantizer levels dramatically improve reconstruction quality at low bitrates.
-- **Transformer predicts raw code indices** — not flattened RVQ codes. With RVQ, you'd either flatten all levels across the sequence dimension or use a separate prediction head per level.
-- **Learning rate schedule in Config but not wired** — `WarmupSteps` field exists, the scheduler isn't implemented in `Trainer.cs`. Add cosine decay with linear warmup.
-- **No proper data split** — `ValSplit` is defined but the current `AudioDataset` re-reads the same files for both train and val. Need a proper split by file index.
-- **Dataset assumes all files are the same sample rate** — resampling implemented but untested.
-- **Dataset loads all files by index on the fly** — no caching or shuffling. For real data sizes, implement a shuffled `DataLoader`.
-- **AudioIO.WriteWav uses `short` data type** — 16-bit output. For high quality, consider 32-bit float WAV.
-- **Transformer is a vanilla encoder stack used causally** — using `TransformerEncoder` with a mask works but isn't as efficient as a proper decoder-only architecture. Consider using `TransformerDecoderLayer` directly or writing a custom attention layer with fused KV-cache.
+- **KV-Cache**: Add KV-cache support to Transformer for O(1) generation per token instead of O(n)
+- **Top-k / Top-p sampling**: Add sampling strategies beyond temperature for more controlled generation
+- **Repetition penalty**: Prevent repetitive patterns in long generations
+- **Batch generation**: Generate multiple sequences in parallel
+- **Training visualization**: TensorBoard or Weights & Biases logging
 
-### Path to a Real Model
+### Path to Production Quality
 
-1. **Dataset**: Collect hours of diverse audio. Eve's current data pipeline works but is naive. Add shuffle, multiprocess loading, and on-the-fly augmentation (noise, pitch shift, tempo).
+1. **Dataset**: Collect hours of diverse, high-quality audio data
+2. **VQ-VAE quality**: Increase latent dim, add Residual Vector Quantization (RVQ)
+3. **Model scale**: Increase transformer depth/width (300M-1B params target)
+4. **Training stability**: Implement LR warmup + cosine decay schedule
+5. **Evaluation**: SI-SNR, PESQ, FAD metrics for audio quality
+6. **Multi-GPU**: Distributed training across multiple GPUs
 
-2. **VQ-VAE quality**: Increase latent dim, add RVQ, increase downsampling ratio. EMA codebook update is already wired. Reference: EnCodec / DAC / MOSS CAT architectures.
+## Troubleshooting
 
-3. **Model scale**: Increase transformer depth/width. 22M params is tiny. Target 300M-1B for interesting generation. Scale gradually, monitoring loss curves.
+### `ggml_new_object: not enough space in the context's memory pool`
 
-4. **Training stability**: LR warmup + cosine schedule (config fields exist, need trainer wiring), weight decay, AdamW instead of Adam. Gradient clipping already wired.
+The Transformer context needs more tensor slots. Edit `TENSOR_OVERHEAD() * 10000` in `eve_native.cpp` and increase the multiplier.
 
-5. **Evaluation**: Implement objective metrics (SI-SNR, PESQ for speech, FAD for audio quality) and log to TensorBoard.
+### Vulkan backend not found
 
-6. **Sampling improvements**: Top-k / top-p filtering, repetition penalty, KV-cache for faster autoregressive generation.
+Ensure `libggml-vulkan.so` and its dependencies are in the same directory as `libeve_native.so`. The `.csproj` copies them automatically during build.
 
-7. **Multi-GPU**: DeepSpeed-style sharding across multiple 4070s or A100s if you get access. The current TorchSharp path supports `DistributedDataParallel` via `torch.distributed`.
+### No audio files in `data/`
 
-### Switching to a Different Tokenizer
+Generate synthetic data first: `dotnet run -- --generate 100`
 
-The VQ-VAE is your own implementation. If you find DAC or MOSS CAT works better, port it to C# via TorchSharp. The interface to preserve:
+### Generated audio sounds noisy
 
-```csharp
-// What the transformer needs:
-Tensor Encode(Tensor audio) → returns codes shaped [batch, seq_len]
-Tensor DecodeFromCodes(Tensor codes) → returns audio shaped [batch, 1, samples]
-```
-
-### LLM-Style Scaling
-
-Eve's transformer is the same architecture as GPT-2, just on audio tokens. Everything that works for text LLMs applies:
-
-- Scale compute (model size × data size)
-- Scale data (more hours, higher quality, more diverse)
-- Scale training (more steps, larger batch, better optimizers)
-
-The 4070 TI Super (16 GB) can probably train 50-100M params with batch size 1-2. The Strix Halo (128 GB unified) can hold larger models but trains slower.
+- Increase temperature toward 0.5-0.7 for more conservative generation
+- Train for more steps (increase `transSteps` in `Program.cs`)
+- Add a prompt audio clip to guide the generation

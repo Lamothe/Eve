@@ -1,124 +1,105 @@
-using TorchSharp;
-using static TorchSharp.torch;
+using System;
+using System.IO;
 
 namespace Eve.Utils;
 
 public static class AudioIO
 {
-    public static (Tensor waveform, int sampleRate) ReadWav(string path)
+    public static float[] ReadWav(string path, out int sampleRate)
     {
-        var bytes = File.ReadAllBytes(path);
-        using var stream = new MemoryStream(bytes);
-        using var reader = new BinaryReader(stream);
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        using var br = new BinaryReader(fs);
 
-        var riff = new string(reader.ReadChars(4));
-        if (riff != "RIFF") throw new Exception("Not a WAV file");
+        // RIFF Header
+        string riff = new string(br.ReadChars(4));
+        if (riff != "RIFF") throw new InvalidDataException("Not a valid RIFF file");
+        br.ReadInt32(); // Chunk size
+        string format = new string(br.ReadChars(4));
+        if (format != "WAVE") throw new InvalidDataException("Not a valid WAVE file");
 
-        reader.ReadInt32();
-        var wave = new string(reader.ReadChars(4));
-        if (wave != "WAVE") throw new Exception("Not a WAV file");
+        int channels = 0;
+        sampleRate = 0;
+        int bitsPerSample = 0;
+        byte[]? dataBytes = null;
 
-        var fmt = new string(reader.ReadChars(4));
-        if (fmt != "fmt ") throw new Exception("No fmt chunk");
-
-        var fmtLen = reader.ReadInt32();
-        var audioFormat = reader.ReadInt16();
-        var numChannels = reader.ReadInt16();
-        var sampleRate = reader.ReadInt32();
-        reader.ReadInt32();
-        reader.ReadInt16();
-        var bitsPerSample = reader.ReadInt16();
-
-        if (fmtLen > 16) reader.ReadBytes((int)fmtLen - 16);
-
-        while (new string(reader.ReadChars(4)) != "data") { }
-
-        var dataSize = reader.ReadInt32();
-        var rawData = reader.ReadBytes(dataSize);
-
-        Tensor samples;
-        if (bitsPerSample == 16)
+        while (fs.Position < fs.Length)
         {
-            var shorts = new short[dataSize / 2];
-            Buffer.BlockCopy(rawData, 0, shorts, 0, rawData.Length);
-            samples = tensor(shorts, float32).div(32768f);
-        }
-        else if (bitsPerSample == 32)
-        {
-            var floats = new float[dataSize / 4];
-            Buffer.BlockCopy(rawData, 0, floats, 0, rawData.Length);
-            samples = tensor(floats, float32);
-        }
-        else
-        {
-            throw new Exception($"Unsupported bits per sample: {bitsPerSample}");
+            string chunkId = new string(br.ReadChars(4));
+            int chunkSize = br.ReadInt32();
+
+            if (chunkId == "fmt ")
+            {
+                short audioFormat = br.ReadInt16(); // 1 = PCM
+                channels = br.ReadInt16();
+                sampleRate = br.ReadInt32();
+                br.ReadInt32(); // Byte rate
+                br.ReadInt16(); // Block align
+                bitsPerSample = br.ReadInt16();
+                if (chunkSize > 16) br.ReadBytes(chunkSize - 16);
+            }
+            else if (chunkId == "data")
+            {
+                dataBytes = br.ReadBytes(chunkSize);
+                break; // We found the audio samples, we can stop
+            }
+            else
+            {
+                br.ReadBytes(chunkSize); // Skip metadata / LIST / INFO chunks
+            }
         }
 
-        if (numChannels > 1)
+        if (dataBytes == null) throw new InvalidDataException("No 'data' chunk found in WAV");
+        if (bitsPerSample != 16) throw new NotSupportedException("Only 16-bit PCM WAV files are supported");
+
+        int numSamples = dataBytes.Length / 2;
+        float[] samples = new float[numSamples];
+        for (int i = 0; i < numSamples; i++)
         {
-            samples = samples.reshape(new long[] { (long)numChannels, -1L }).mean(new long[] { 0 });
+            short s = BitConverter.ToInt16(dataBytes, i * 2);
+            samples[i] = s / 32768f; // Normalize to [-1.0, 1.0]
         }
 
-        return (samples.reshape(1, -1), sampleRate);
+        // Downmix stereo to mono if necessary
+        if (channels == 2)
+        {
+            float[] mono = new float[numSamples / 2];
+            for (int i = 0; i < mono.Length; i++)
+            {
+                mono[i] = (samples[i * 2] + samples[i * 2 + 1]) / 2f;
+            }
+            return mono;
+        }
+
+        return samples;
     }
 
     public static void WriteWav(string path, float[] samples, int sampleRate)
     {
-        var max = 0f;
+        short[] pcm = new short[samples.Length];
         for (int i = 0; i < samples.Length; i++)
         {
-            var abs = Math.Abs(samples[i]);
-            if (abs > max) max = abs;
+            float s = Math.Clamp(samples[i], -1f, 1f);
+            pcm[i] = (short)(s * 32767f);
         }
-        if (max < 1e-8f) max = 1f;
-        var data = new byte[samples.Length * 2];
-        for (int i = 0; i < samples.Length; i++)
-        {
-            var s = (short)(samples[i] / max * 32767f);
-            data[i * 2] = (byte)(s & 0xFF);
-            data[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
-        }
-        WriteRawWav(path, data, sampleRate);
-    }
 
-    public static void WriteWav(string path, Tensor waveform, int sampleRate)
-    {
-        var mono = waveform.squeeze();
-        if (mono.dim() > 1) mono = mono.mean(new long[] { 0 }).reshape(new long[] { -1 });
+        int dataSize = pcm.Length * 2;
+        using var fs = new FileStream(path, FileMode.Create);
+        using var bw = new BinaryWriter(fs);
 
-        var normalized = mono.div(mono.abs().max() + 1e-8f).clamp(-1f, 1f);
-        var shorts = normalized.mul(32767f).to(int16);
+        bw.Write(new[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' });
+        bw.Write(36 + dataSize);
+        bw.Write(new[] { (byte)'W', (byte)'A', (byte)'V', (byte)'E' });
+        bw.Write(new[] { (byte)'f', (byte)'m', (byte)'t', (byte)' ' });
+        bw.Write(16);
+        bw.Write((short)1);
+        bw.Write((short)1);
+        bw.Write(sampleRate);
+        bw.Write(sampleRate * 2);
+        bw.Write((short)2);
+        bw.Write((short)16);
+        bw.Write(new[] { (byte)'d', (byte)'a', (byte)'t', (byte)'a' });
+        bw.Write(dataSize);
 
-        var shortsArr = shorts.data<short>().ToArray();
-        var data = new byte[shortsArr.Length * 2];
-        Buffer.BlockCopy(shortsArr, 0, data, 0, data.Length);
-
-        WriteRawWav(path, data, sampleRate);
-    }
-
-    private static void WriteRawWav(string path, byte[] data, int sampleRate)
-    {
-        using var stream = new MemoryStream();
-        using var writer = new BinaryWriter(stream);
-
-        var dataSize = data.Length;
-        var fileSize = 36 + dataSize;
-
-        writer.Write("RIFF".ToCharArray());
-        writer.Write(fileSize);
-        writer.Write("WAVE".ToCharArray());
-        writer.Write("fmt ".ToCharArray());
-        writer.Write(16);
-        writer.Write((short)1);
-        writer.Write((short)1);
-        writer.Write(sampleRate);
-        writer.Write(sampleRate * 2);
-        writer.Write((short)2);
-        writer.Write((short)16);
-        writer.Write("data".ToCharArray());
-        writer.Write(dataSize);
-        writer.Write(data);
-
-        File.WriteAllBytes(path, stream.ToArray());
+        foreach (var s in pcm) bw.Write(s);
     }
 }

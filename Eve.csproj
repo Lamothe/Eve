@@ -8,9 +8,17 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="libtorch-cpu-linux-x64" Version="2.10.0" />
-    <PackageReference Include="TorchSharp" Version="0.103.0" />
     <PackageReference Include="KokoroSharp.CPU" Version="0.6.2" />
   </ItemGroup>
+
+  <Target Name="CopyNativeLibs" AfterTargets="Build">
+    <Exec Command="cp $(MSBuildProjectDirectory)/lib/libeve_native.so $(TargetDir)" />
+    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-base.so.0.13.1 $(TargetDir)" />
+    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-cpu.so.0.13.1 $(TargetDir)" />
+    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-vulkan.so.0.13.1 $(TargetDir)" />
+    <Exec Command="ln -sf libggml-base.so.0.13.1 $(TargetDir)libggml-base.so.0; ln -sf libggml-base.so.0 $(TargetDir)libggml-base.so || true" />
+    <Exec Command="ln -sf libggml-cpu.so.0.13.1 $(TargetDir)libggml-cpu.so.0; ln -sf libggml-cpu.so.0 $(TargetDir)libggml-cpu.so || true" />
+    <Exec Command="ln -sf libggml-vulkan.so.0.13.1 $(TargetDir)libggml-vulkan.so.0; ln -sf libggml-vulkan.so.0 $(TargetDir)libggml-vulkan.so || true" />
+  </Target>
 
 </Project>
