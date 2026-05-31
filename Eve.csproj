@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="libtorch-cpu-linux-x64" Version="2.10.0" />
     <PackageReference Include="TorchSharp" Version="0.103.0" />
+    <PackageReference Include="KokoroSharp.CPU" Version="0.6.2" />
   </ItemGroup>
 
 </Project>

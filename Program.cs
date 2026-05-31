@@ -14,6 +14,14 @@ class Program
         Console.WriteLine();
 
         var cfg = new Utils.Config();
+
+        if (args.Length > 0 && args[0] == "--generate")
+        {
+            var count = args.Length > 1 ? int.Parse(args[1]) : 50;
+            RunGenerator(cfg, count);
+            return;
+        }
+
         var device = torch.cuda.is_available() ? torch.CUDA : torch.CPU;
         Console.WriteLine($"Device: {device}");
 
@@ -36,7 +44,8 @@ class Program
 
         if (!Directory.Exists(cfg.DataPath) || Directory.GetFiles(cfg.DataPath, "*.wav", SearchOption.AllDirectories).Length == 0)
         {
-            Console.WriteLine($"Place .wav files in '{cfg.DataPath}/' and run again.");
+            Console.WriteLine($"No training data found in '{cfg.DataPath}/'.");
+            Console.WriteLine($"Run 'dotnet run -- --generate 50' to generate synthetic data.");
             SmokeTest();
             return;
         }
@@ -47,26 +56,20 @@ class Program
         var dataset = new Data.AudioDataset(cfg.DataPath, cfg.SampleRate, cfg.AudioLengthSamples);
         var trainer = new Training.Trainer(vqvae, transformer, device, cfg);
 
-        // Load checkpoints if requested
-        if (args.Length > 0 && args[0] == "--resume")
+        var resumeEpoch = FindResumeEpoch(args);
+        if (resumeEpoch > 0)
         {
-            var epoch = args.Length > 1 ? int.Parse(args[1]) : 10;
-            trainer.LoadCheckpoint("vqvae", epoch);
-            trainer.LoadCheckpoint("transformer", epoch);
+            trainer.LoadCheckpoint("vqvae", resumeEpoch);
+            trainer.LoadCheckpoint("transformer", resumeEpoch);
         }
 
-        // Create validation split
         Data.AudioDataset? valDataset = null;
         if (cfg.ValSplit > 0 && dataset.Count > 1)
         {
             var valCount = (int)(dataset.Count * cfg.ValSplit);
             var trainCount = (int)(dataset.Count - valCount);
             if (trainCount > 0 && valCount > 0)
-            {
                 Console.WriteLine($"Split: {trainCount} train, {valCount} val");
-                valDataset = new Data.AudioDataset(cfg.DataPath, cfg.SampleRate, cfg.AudioLengthSamples);
-                // valDataset re-reads the same files; we handle split via skip in trainer
-            }
         }
 
         Console.WriteLine("\nTraining VQ-VAE...");
@@ -85,6 +88,12 @@ class Program
         }
     }
 
+    static void RunGenerator(Utils.Config cfg, int count)
+    {
+        using var gen = new Data.SyntheticDataGenerator();
+        gen.Generate(cfg, count);
+    }
+
     static long CountParams(nn.Module<Tensor, Tensor> m)
     {
         long total = 0;
@@ -95,6 +104,14 @@ class Program
             total += sz;
         }
         return total;
+    }
+
+    static int FindResumeEpoch(string[] args)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+            if (args[i] == "--resume" && int.TryParse(args[i + 1], out var epoch))
+                return epoch;
+        return 0;
     }
 
     static void SmokeTest()
