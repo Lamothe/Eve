@@ -57,7 +57,7 @@ public class SyntheticDataGenerator : IDisposable
     {
         Console.WriteLine("Loading Kokoro TTS model (first run downloads ~320MB)...");
         _tts = KokoroTTS.LoadModel();
-        _voices = [KokoroVoiceManager.GetVoice("af_sarah"), KokoroVoiceManager.GetVoice("af_heart"), KokoroVoiceManager.GetVoice("am_michael")];
+        _voices = [.. KokoroVoiceManager.GetVoices(KokoroLanguage.AmericanEnglish, KokoroGender.Female)];
         Console.WriteLine($"Loaded {_voices.Length} voices");
     }
 
