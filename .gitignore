@@ -1,0 +1,7 @@
+bin/
+obj/
+*.wav
+*.wav~
+checkpoints/
+generated.wav
+data/*.wav
