@@ -62,6 +62,25 @@ public static class AudioIO
         return (samples.reshape(1, -1), sampleRate);
     }
 
+    public static void WriteWav(string path, float[] samples, int sampleRate)
+    {
+        var max = 0f;
+        for (int i = 0; i < samples.Length; i++)
+        {
+            var abs = Math.Abs(samples[i]);
+            if (abs > max) max = abs;
+        }
+        if (max < 1e-8f) max = 1f;
+        var data = new byte[samples.Length * 2];
+        for (int i = 0; i < samples.Length; i++)
+        {
+            var s = (short)(samples[i] / max * 32767f);
+            data[i * 2] = (byte)(s & 0xFF);
+            data[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+        }
+        WriteRawWav(path, data, sampleRate);
+    }
+
     public static void WriteWav(string path, Tensor waveform, int sampleRate)
     {
         var mono = waveform.squeeze();
@@ -74,6 +93,11 @@ public static class AudioIO
         var data = new byte[shortsArr.Length * 2];
         Buffer.BlockCopy(shortsArr, 0, data, 0, data.Length);
 
+        WriteRawWav(path, data, sampleRate);
+    }
+
+    private static void WriteRawWav(string path, byte[] data, int sampleRate)
+    {
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream);
 

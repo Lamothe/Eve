@@ -1,7 +1,6 @@
 using KokoroSharp;
 using KokoroSharp.Core;
 using KokoroSharp.Processing;
-using static TorchSharp.torch;
 
 namespace Eve.Data;
 
@@ -92,12 +91,8 @@ public class SyntheticDataGenerator : IDisposable
                 continue;
             }
 
-            using (no_grad())
-            {
-                var t = tensor(samples, float32).reshape(1, -1);
-                var path = Path.Combine(cfg.DataPath, $"synth_{i:D4}_{voice.Name}_{speed:F1}x.wav");
-                Utils.AudioIO.WriteWav(path, t, cfg.SampleRate);
-            }
+            var path = Path.Combine(cfg.DataPath, $"synth_{i:D4}_{voice.Name}_{speed:F1}x.wav");
+            Utils.AudioIO.WriteWav(path, samples, cfg.SampleRate);
 
             Console.WriteLine($"{samples.Length / (double)cfg.SampleRate:F1}s");
         }
@@ -125,6 +120,7 @@ public class SyntheticDataGenerator : IDisposable
 
     public void Dispose()
     {
-        _tts?.Dispose();
+        try { _tts?.Dispose(); }
+        catch { /* KokoroSharp OpenAL cleanup may fail on headless systems */ }
     }
 }

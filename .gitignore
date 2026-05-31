@@ -5,3 +5,4 @@ obj/
 checkpoints/
 generated.wav
 data/*.wav
+kokoro.onnx
