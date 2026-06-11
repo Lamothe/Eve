@@ -47,6 +47,16 @@ namespace Eve.Native
             return eve_load_model(_handle, path);
         }
 
+        public int SaveCheckpoint(string path)
+        {
+            return eve_save_checkpoint(_handle, path);
+        }
+
+        public int LoadCheckpoint(string path)
+        {
+            return eve_load_checkpoint(_handle, path);
+        }
+
         public void Dispose()
         {
             Dispose(true);
@@ -96,5 +106,11 @@ namespace Eve.Native
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
         private static extern int eve_load_model(IntPtr handle, string path);
+
+        [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int eve_save_checkpoint(IntPtr handle, string path);
+
+        [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int eve_load_checkpoint(IntPtr handle, string path);
     }
 }

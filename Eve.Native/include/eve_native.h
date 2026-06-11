@@ -37,6 +37,12 @@ int eve_save_model(eve_handle * h, const char * path);
 // Load model weights from file (returns 0 on success)
 int eve_load_model(eve_handle * h, const char * path);
 
+// Save full training checkpoint (weights + moments + iteration count)
+int eve_save_checkpoint(eve_handle * h, const char * path);
+
+// Load training checkpoint (returns AdamW iteration count, or -1 on failure)
+int eve_load_checkpoint(eve_handle * h, const char * path);
+
 #ifdef __cplusplus
 }
 #endif

@@ -681,3 +681,110 @@ int eve_load_model(eve_handle * h, const char * path) {
     fclose(f);
     return 0;
 }
+
+int eve_save_checkpoint(eve_handle * h, const char * path) {
+    FILE * f = fopen(path, "wb");
+    if (!f) return -1;
+
+    // Save config
+    fwrite(&h->vocab_size, sizeof(int), 1, f);
+    fwrite(&h->embed_dim, sizeof(int), 1, f);
+    fwrite(&h->num_heads, sizeof(int), 1, f);
+    fwrite(&h->num_layers, sizeof(int), 1, f);
+    fwrite(&h->feed_forward_dim, sizeof(int), 1, f);
+    fwrite(&h->max_seq_len, sizeof(int), 1, f);
+
+    // Save AdamW iteration count
+    fwrite(&h->adamw_iter, sizeof(int), 1, f);
+
+    // Save all weights
+    for (int i = 0; i < h->num_weight_tensors; i++) {
+        struct ggml_tensor * w = h->all_weights[i];
+        int ne0 = (int)w->ne[0];
+        int ne1 = (int)w->ne[1];
+        fwrite(&ne0, sizeof(int), 1, f);
+        fwrite(&ne1, sizeof(int), 1, f);
+        size_t nbytes = ggml_nbytes(w);
+        float * data = (float *)malloc(nbytes);
+        ggml_backend_tensor_get(w, data, 0, nbytes);
+        fwrite(data, 1, nbytes, f);
+        free(data);
+    }
+
+    // Save all moment tensors (m and v)
+    for (int i = 0; i < h->num_weight_tensors; i++) {
+        struct ggml_tensor * m = h->m_tensors[i];
+        struct ggml_tensor * v = h->v_tensors[i];
+        size_t m_bytes = ggml_nbytes(m);
+        size_t v_bytes = ggml_nbytes(v);
+        float * m_data = (float *)malloc(m_bytes);
+        float * v_data = (float *)malloc(v_bytes);
+        ggml_backend_tensor_get(m, m_data, 0, m_bytes);
+        ggml_backend_tensor_get(v, v_data, 0, v_bytes);
+        fwrite(m_data, 1, m_bytes, f);
+        fwrite(v_data, 1, v_bytes, f);
+        free(m_data);
+        free(v_data);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int eve_load_checkpoint(eve_handle * h, const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) return -1;
+
+    // Load and verify config
+    int vocab_size, embed_dim, num_heads, num_layers, feed_forward_dim, max_seq_len;
+    fread(&vocab_size, sizeof(int), 1, f);
+    fread(&embed_dim, sizeof(int), 1, f);
+    fread(&num_heads, sizeof(int), 1, f);
+    fread(&num_layers, sizeof(int), 1, f);
+    fread(&feed_forward_dim, sizeof(int), 1, f);
+    fread(&max_seq_len, sizeof(int), 1, f);
+
+    if (vocab_size != h->vocab_size || embed_dim != h->embed_dim ||
+        num_heads != h->num_heads || num_layers != h->num_layers ||
+        feed_forward_dim != h->feed_forward_dim || max_seq_len != h->max_seq_len) {
+        fclose(f);
+        return -2;
+    }
+
+    // Load AdamW iteration count
+    int iter;
+    fread(&iter, sizeof(int), 1, f);
+    h->adamw_iter = iter;
+
+    // Load all weights
+    for (int i = 0; i < h->num_weight_tensors; i++) {
+        struct ggml_tensor * w = h->all_weights[i];
+        int ne0, ne1;
+        fread(&ne0, sizeof(int), 1, f);
+        fread(&ne1, sizeof(int), 1, f);
+        size_t nbytes = ggml_nbytes(w);
+        float * data = (float *)malloc(nbytes);
+        fread(data, 1, nbytes, f);
+        ggml_backend_tensor_set(w, data, 0, nbytes);
+        free(data);
+    }
+
+    // Load all moment tensors (m and v)
+    for (int i = 0; i < h->num_weight_tensors; i++) {
+        struct ggml_tensor * m = h->m_tensors[i];
+        struct ggml_tensor * v = h->v_tensors[i];
+        size_t m_bytes = ggml_nbytes(m);
+        size_t v_bytes = ggml_nbytes(v);
+        float * m_data = (float *)malloc(m_bytes);
+        float * v_data = (float *)malloc(v_bytes);
+        fread(m_data, 1, m_bytes, f);
+        fread(v_data, 1, v_bytes, f);
+        ggml_backend_tensor_set(m, m_data, 0, m_bytes);
+        ggml_backend_tensor_set(v, v_data, 0, v_bytes);
+        free(m_data);
+        free(v_data);
+    }
+
+    fclose(f);
+    return iter;
+}

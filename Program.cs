@@ -14,7 +14,7 @@ namespace Eve
             if (args.Length == 0)
             {
                 Console.WriteLine("Usage:");
-                Console.WriteLine("  eve train <audio_dir> <output_model>");
+                Console.WriteLine("  eve train <audio_dir> <output_model> [--resume <checkpoint>]");
                 Console.WriteLine("  eve generate <model> <prompt_audio> <output_audio> [num_frames] [temperature]");
                 return;
             }
@@ -26,10 +26,18 @@ namespace Eve
                 case "train":
                     if (args.Length < 3)
                     {
-                        Console.WriteLine("Usage: eve train <audio_dir> <output_model>");
+                        Console.WriteLine("Usage: eve train <audio_dir> <output_model> [--resume <checkpoint>]");
                         return;
                     }
-                    Train(args[1], args[2]);
+                    string? checkpointPath = null;
+                    for (int i = 3; i < args.Length - 1; i++)
+                    {
+                        if (args[i] == "--resume")
+                        {
+                            checkpointPath = args[i + 1];
+                        }
+                    }
+                    Train(args[1], args[2], checkpointPath);
                     break;
 
                 case "generate":
@@ -49,7 +57,7 @@ namespace Eve
             }
         }
 
-        static void Train(string audioDir, string outputPath)
+        static void Train(string audioDir, string outputPath, string? checkpointPath)
         {
             Console.WriteLine($"Training on audio from: {audioDir}");
 
@@ -61,14 +69,15 @@ namespace Eve
             int topK = 32;
             int vocabSize = fftSize / 2 + 1; // 513 bins
 
-      int embedDim = 256;
+            int embedDim = 256;
             int numHeads = 4;
             int numLayers = 4;
             int feedForwardDim = 1024;
             int maxSeqLen = 128;
 
             int numEpochs = 50;
-      float learningRate = 0.00001f;
+            int checkpointEvery = 5; // Save checkpoint every N epochs
+            float learningRate = 0.00001f;
 
             // Initialize tokenizer
             var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);
@@ -108,15 +117,34 @@ namespace Eve
             Console.Out.Flush();
             using var model = new EveNativeHandle(vocabSize, embedDim, numHeads, numLayers,
                                                    feedForwardDim, maxSeqLen);
-            model.InitWeights(42);
             model.SetLearningRate(learningRate);
 
+            int startEpoch = 0;
+            if (checkpointPath != null && File.Exists(checkpointPath))
+            {
+                Console.WriteLine($"Loading checkpoint from {checkpointPath}...");
+                int iter = model.LoadCheckpoint(checkpointPath);
+                if (iter >= 0)
+                {
+                    Console.WriteLine($"Checkpoint loaded (AdamW iter={iter})");
+                }
+                else
+                {
+                    Console.WriteLine($"Failed to load checkpoint (error {iter}), initializing fresh");
+                    model.InitWeights(42);
+                }
+            }
+            else
+            {
+                model.InitWeights(42);
+            }
+
             // Training loop
-            Console.WriteLine($"Training for {numEpochs} epochs...");
+            Console.WriteLine($"Training for {numEpochs} epochs (starting from epoch {startEpoch + 1})...");
             Console.Out.Flush();
             int globalStep = 0;
 
-            for (int epoch = 0; epoch < numEpochs; epoch++)
+            for (int epoch = startEpoch; epoch < numEpochs; epoch++)
             {
                 Console.WriteLine($"Epoch {epoch + 1}/{numEpochs} starting...");
                 Console.Out.Flush();
@@ -126,34 +154,49 @@ namespace Eve
                 // Shuffle files
                 var shuffled = allTokens.OrderBy(x => Guid.NewGuid()).ToList();
 
-            foreach (var tokens in shuffled)
-            {
-                // Split into chunks of maxSeqLen
-                for (int start = 0; start < tokens.Length - maxSeqLen; start += maxSeqLen / 2)
+                foreach (var tokens in shuffled)
                 {
-                    int chunkLen = Math.Min(maxSeqLen, tokens.Length - start);
-                    if (chunkLen < 2) continue;
-
-                    var chunk = new int[chunkLen];
-                    Array.Copy(tokens, start, chunk, 0, chunkLen);
-
-                    float loss = model.TrainStep(chunk, chunkLen);
-                    epochLoss += loss;
-                    epochSteps++;
-                    globalStep++;
-
-                    if (globalStep % 10 == 0)
+                    // Split into chunks of maxSeqLen
+                    for (int start = 0; start < tokens.Length - maxSeqLen; start += maxSeqLen / 2)
                     {
-                        Console.WriteLine($"  Step {globalStep}: loss = {loss:F4}");
+                        int chunkLen = Math.Min(maxSeqLen, tokens.Length - start);
+                        if (chunkLen < 2) continue;
+
+                        var chunk = new int[chunkLen];
+                        Array.Copy(tokens, start, chunk, 0, chunkLen);
+
+                        float loss = model.TrainStep(chunk, chunkLen);
+                        epochLoss += loss;
+                        epochSteps++;
+                        globalStep++;
+
+                        if (globalStep % 10 == 0)
+                        {
+                            Console.WriteLine($"  Step {globalStep}: loss = {loss:F4}");
+                        }
+                    }
+                }
+
+                float avgLoss = epochSteps > 0 ? epochLoss / epochSteps : 0.0f;
+                Console.WriteLine($"Epoch {epoch + 1}/{numEpochs}: avg loss = {avgLoss:F4}");
+
+                // Save checkpoint periodically
+                if ((epoch + 1) % checkpointEvery == 0)
+                {
+                    string ckptPath = $"{outputPath}.ckpt_ep{epoch + 1}";
+                    int ckptResult = model.SaveCheckpoint(ckptPath);
+                    if (ckptResult == 0)
+                    {
+                        Console.WriteLine($"Checkpoint saved to: {ckptPath}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Failed to save checkpoint (error {ckptResult})");
                     }
                 }
             }
 
-                float avgLoss = epochSteps > 0 ? epochLoss / epochSteps : 0.0f;
-                Console.WriteLine($"Epoch {epoch + 1}/{numEpochs}: avg loss = {avgLoss:F4}");
-            }
-
-            // Save model
+            // Save final model
             int saveResult = model.SaveModel(outputPath);
             if (saveResult == 0)
             {
@@ -179,11 +222,11 @@ namespace Eve
             int topK = 32;
             int vocabSize = fftSize / 2 + 1;
 
-            int embedDim = 128;
+            int embedDim = 256;
             int numHeads = 4;
-            int numLayers = 2;
-            int feedForwardDim = 512;
-            int maxSeqLen = 64;
+            int numLayers = 4;
+            int feedForwardDim = 1024;
+            int maxSeqLen = 128;
 
             // Initialize tokenizer
             var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);
