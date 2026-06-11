@@ -1,206 +1,106 @@
 # Eve — Audio-Native Transformer
 
-Train a causal transformer on discrete audio tokens, analogous to how LLMs train on text tokens. No text, no TTS, no STT — raw audio in, raw audio out.
+**Status: Working — Vulkan GPU training on AMD Strix Halo**
 
-## Architecture
+## Architecture (Current — DFT-based)
 
-### VQ-VAE (Audio Tokenizer)
-
-Converts raw audio waveforms into discrete codes, then decodes codes back to audio.
+Audio is tokenized via STFT top-K frequency bin selection, then modeled with a causal transformer that predicts the next DFT bin index.
 
 ```
-Audio (float32) → Encoder → Vector Quantizer → Discrete Codes → Decoder → Audio (float32)
+Audio (float32) → STFT → Top-K bins/frame → Flattened token sequence → Causal Transformer → Logits → Sample next bin
 ```
 
-- **Encoder**: 4× downsampling via Conv1d (stride 2) + ResidualBlock(GELU), then project to latent dim
-- **Vector Quantizer**: Nearest-neighbor lookup into a learnable codebook. EMA codebook update with configurable decay (0.99), values clamped to ±5
-- **Decoder**: 4× upsampling via ConvTranspose1d (stride 2) + ResidualBlock(GELU), then project back to 1 channel
-- **Downsampling factor**: 2^4 = 16×. 24 kHz audio → 1500 tokens/sec
-- **Current defaults**: codebook=256, latent_dim=64
+- **STFT**: 1024 window, 256 hop, 1024 FFT → 513 bins
+- **Tokens**: Top-32 bins per frame, flattened to ~3000 tokens/sec
+- **Model**: ggml/llama.cpp native backend with Vulkan GPU acceleration
+- **Optimizer**: AdamW with GPU-resident optimizer step (ggml_opt_step_adamw)
 
-### Transformer
+### Current Model Configuration
 
-Causal (decoder-only) transformer that predicts the next audio token.
-
-```
-Codes → Embedding + PositionEncoding → TransformerEncoder(causal) → LayerNorm → Linear(vocab)
-```
-
-- Built with **ggml/llama.cpp** native backend — runs on GPU via Vulkan
-- 512-dim embedding, 8 heads, 6 layers, 2048 FFN dim
-- Causal mask applied per-layer
-- AdamW optimizer with full backward pass on GPU
+- **Parameters**: ~2.5M
+- **Embedding dimension**: 256
+- **Transformer layers**: 4
+- **Feed-forward dimension**: 1024
+- **Sequence length**: 128
+- **Training epochs**: 50
+- **Learning rate**: 0.00001
 
 ## Project Structure
 
 ```
 Eve/
-├── Eve.csproj                  # .NET 10 project, C# P/Invoke wrapper
-├── Program.cs                  # Entry point, CLI flags, 3-phase training pipeline
+├── Eve.csproj                  # .NET 10 project
+├── Program.cs                  # Entry point, CLI: train, generate
 ├── Utils/
-│   ├── Config.cs               # Hyperparameters
-│   └── AudioIO.cs              # WAV read/write (pure C#, no native bindings)
+│   ├── STFT.cs                 # STFT/iSTFT with Hann window, overlap-add
+│   ├── AudioIO.cs              # WAV read/write (PCM mono)
+│   └── Config.cs
 ├── Data/
-│   ├── AudioDataset.cs         # Loads .wav files, zero-pads, serves batches
-│   └── SyntheticDataGenerator.cs # KokoroSharp-based synthetic audio generation
-├── Native/
-│   └── EveNative.cs            # C# P/Invoke wrapper for libeve_native.so
-├── Eve.Native/                 # Native library (C++ / ggml / Vulkan)
+│   └── AudioTokenizer.cs       # Encodes audio → top-K bin indices
+├── Eve.Native/                 # Native library (C++ / ggml)
 │   ├── CMakeLists.txt
+│   ├── include/
+│   │   └── eve_native.h        # Public C API
 │   └── src/
-│       └── eve_native.cpp      # Encoder, Decoder, Transformer, AdamW, Vulkan backend
-├── lib/                        # Built native libraries (gitignored)
-├── output/                     # Trained weights (gitignored)
-├── data/                       # Training audio (.wav, gitignored)
+│       └── eve_native.cpp      # Transformer, AdamW, Vulkan training
+├── lib/                        # Built native libraries
+├── output/                     # Trained weights
+├── data/                       # Training audio (.wav)
 └── README.md
 ```
 
-## Running
-
-### Prerequisites
-
-- Linux with AMD GPU supporting Vulkan (RADV driver)
-- .NET 10 SDK
-- 24 kHz mono .wav files in `data/` (or generate them)
-
-### Generate Training Data
+## Building
 
 ```bash
-dotnet run -- --generate 100   # Generate 100 synthetic .wav files
+# Build native library (requires llama.cpp with Vulkan support)
+cmake -S Eve.Native -B Eve.Native/build
+cmake --build Eve.Native/build -j$(nproc)
+
+# Build C# project
+dotnet build
 ```
 
-### Train (VQ-VAE + Transformer)
+## CLI
 
 ```bash
-dotnet run                     # Full 3-phase pipeline
+# Train on audio files (uses Vulkan GPU automatically)
+dotnet run -- train <audio_dir> <output_model.bin>
+
+# Generate audio from trained model
+dotnet run -- generate <model.bin> <prompt.wav> <output.wav> <num_frames> <temperature>
 ```
 
-The training pipeline runs three phases:
+## Vulkan Backend
 
-1. **Phase 0**: Encode all audio files → `data/codes.bin` (discrete token sequences)
-2. **Phase 1**: Train VQ-VAE (5000 steps, AdamW, GPU) — saves to `output/eve_vqvae_trained.bin`
-3. **Phase 2**: Train Transformer (10000 steps, AdamW, GPU) — saves to `output/eve_transformer_trained.bin`
+Training runs entirely on the AMD Radeon 8060S GPU via Vulkan:
 
-### Resume Training
+- **Cross-entropy loss**: Decomposed into `softmax → log → mul → sum → scale` (all Vulkan-supported ops)
+- **Weights & moments**: Allocated on Vulkan backend
+- **Computation graph**: Fresh context per training step to avoid memory leaks
+- **AdamW update**: Fully GPU-resident using `ggml_opt_step_adamw` from llama.cpp's optimization infrastructure
+  - No CPU↔GPU transfers during optimization
+  - 2.5x speedup compared to CPU-based AdamW
+  - Enables practical training of larger models (~10 hours for 50 epochs on 2.5M params)
 
-```bash
-dotnet run -- --resume         # Load existing weights, continue training
-```
+### Key Insight
 
-If existing weights are found in `output/`, training continues from there instead of starting from scratch.
-
-### Generate Audio
-
-```bash
-dotnet run -- --generate-audio 1500 0.9     # Generate from scratch, 1500 tokens, temp=0.9
-dotnet run -- --generate-audio 1500 0.9 prompt.wav  # Condition on prompt audio
-dotnet run -- --generate-audio 1500 0.9 prompt.wav output.wav  # Save to specific path
-```
-
-## CLI Flags
-
-| Flag | Description |
-|------|-------------|
-| `--generate <N>` | Generate N synthetic .wav files (female voices, random prompts) |
-| `--generate-audio <tokens> <temp> [prompt.wav] [output.wav]` | Generate audio from trained model |
-| `--resume` | Continue training from existing weights in `output/` |
-| `--test-native` | Run P/Invoke wrapper tests |
-
-## Technology Stack
-
-| Component | Technology |
-|-----------|------------|
-| Language | C# / .NET 10 |
-| Native Backend | ggml/llama.cpp with Vulkan |
-| GPU Acceleration | AMD RADV (Strix Halo: RADV STRIX_HALO) |
-| Optimizer | AdamW (F32 precision) |
-| Audio I/O | Pure C# WAV reader/writer |
-
-## Current Status
-
-| Phase | Status | Time |
-|-------|--------|------|
-| Phase 0: Encoding | ✅ Working | ~16s for 246 files |
-| Phase 1: VQ-VAE Training | ✅ Working | ~47s (5000 steps) |
-| Phase 2: Transformer Training | ✅ Working | ~15min (10000 steps) |
-| Audio Generation | ✅ Working | ~1 token/sec |
-
-**Training results** (on 246 synthetic audio files):
-- VQ-VAE loss converged to ~0.02 after 5000 steps
-- Transformer loss dropped from ~8.3 (random) to ~5.55 after 10000 steps
-- Weights saved to `output/` directory (gitignored)
+llama.cpp provides `ggml_opt_step_adamw`, a built-in ggml operation that runs the entire AdamW update on GPU. By integrating this into the training graph, we eliminate the PCIe bottleneck that previously made GPU training impractical.
 
 ## Hardware
 
-| Hardware | Platform |
-|----------|----------|
-| Strix Halo (AMD) | Primary dev platform — 128 GB RAM, RADV STRIX_HALO Vulkan |
-| NVIDIA CUDA | Not yet tested — would require CUDA backend in ggml |
+- **GPU**: AMD Radeon 8060S (Strix Halo) — RDNA3.5, gfx1151
+- **RAM**: 128 GB unified memory
+- **Training**: Vulkan backend via ggml/llama.cpp
+- **OS**: Fedora 44 with ROCm 7.1.1 userspace packages
 
-## How It Works
+## Performance
 
-### Tokenization (VQ-VAE)
+With GPU-resident AdamW:
+- **Small model (530K params)**: ~14 minutes for 3 epochs
+- **Large model (2.5M params)**: ~10 hours for 50 epochs (estimated)
 
-```
-Audio (24000 samples) → Encoder (4× Conv1d + ResBlocks) → [64-dim latent] → Quantize → Code index
-```
+Without GPU AdamW (CPU-based optimizer):
+- **Small model**: ~35 minutes for 3 epochs
+- **Large model**: ~26 hours for 50 epochs (estimated)
 
-Each 1-second audio clip produces ~1500 discrete code indices. The codebook maps each index back to a 64-dimensional vector, which the decoder reconstructs into audio.
-
-### Next-Token Prediction (Transformer)
-
-```
-[code0, code1, code2, ...] → Embedding + PosEnc → Transformer blocks → Logits → Sample next code
-```
-
-The Transformer autoregressively predicts the next code token given all previous codes. During generation, each step builds a forward graph for the full sequence (without KV-cache), samples the last position's logits with temperature, and appends the token.
-
-### Generation Pipeline
-
-```
-Prompt audio → VQ-VAE encode → initial codes → Transformer generate (N tokens) → Decode (VQ-VAE) → Output WAV
-```
-
-1. Encode prompt audio through VQ-VAE encoder to get initial codes
-2. Autoregressively generate N codes using the Transformer (temperature sampling)
-3. Decode the full code sequence through the VQ-VAE decoder
-4. Write reconstructed audio to WAV file
-
-## What's Next
-
-### Immediate Improvements
-
-- **KV-Cache**: Add KV-cache support to Transformer for O(1) generation per token instead of O(n)
-- **Top-k / Top-p sampling**: Add sampling strategies beyond temperature for more controlled generation
-- **Repetition penalty**: Prevent repetitive patterns in long generations
-- **Batch generation**: Generate multiple sequences in parallel
-- **Training visualization**: TensorBoard or Weights & Biases logging
-
-### Path to Production Quality
-
-1. **Dataset**: Collect hours of diverse, high-quality audio data
-2. **VQ-VAE quality**: Increase latent dim, add Residual Vector Quantization (RVQ)
-3. **Model scale**: Increase transformer depth/width (300M-1B params target)
-4. **Training stability**: Implement LR warmup + cosine decay schedule
-5. **Evaluation**: SI-SNR, PESQ, FAD metrics for audio quality
-6. **Multi-GPU**: Distributed training across multiple GPUs
-
-## Troubleshooting
-
-### `ggml_new_object: not enough space in the context's memory pool`
-
-The Transformer context needs more tensor slots. Edit `TENSOR_OVERHEAD() * 10000` in `eve_native.cpp` and increase the multiplier.
-
-### Vulkan backend not found
-
-Ensure `libggml-vulkan.so` and its dependencies are in the same directory as `libeve_native.so`. The `.csproj` copies them automatically during build.
-
-### No audio files in `data/`
-
-Generate synthetic data first: `dotnet run -- --generate 100`
-
-### Generated audio sounds noisy
-
-- Increase temperature toward 0.5-0.7 for more conservative generation
-- Train for more steps (increase `transSteps` in `Program.cs`)
-- Add a prompt audio clip to guide the generation
+The 2.5x speedup comes from eliminating ~70 MB/step of PCIe transfers between GPU and CPU.

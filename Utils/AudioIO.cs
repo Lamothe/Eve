@@ -1,105 +1,142 @@
 using System;
 using System.IO;
 
-namespace Eve.Utils;
-
-public static class AudioIO
+namespace Eve.Utils
 {
-    public static float[] ReadWav(string path, out int sampleRate)
+    public class AudioData
     {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
-        using var br = new BinaryReader(fs);
+        public float[] Samples { get; set; }
+        public int SampleRate { get; set; }
 
-        // RIFF Header
-        string riff = new string(br.ReadChars(4));
-        if (riff != "RIFF") throw new InvalidDataException("Not a valid RIFF file");
-        br.ReadInt32(); // Chunk size
-        string format = new string(br.ReadChars(4));
-        if (format != "WAVE") throw new InvalidDataException("Not a valid WAVE file");
-
-        int channels = 0;
-        sampleRate = 0;
-        int bitsPerSample = 0;
-        byte[]? dataBytes = null;
-
-        while (fs.Position < fs.Length)
+        public AudioData(float[] samples, int sampleRate)
         {
-            string chunkId = new string(br.ReadChars(4));
-            int chunkSize = br.ReadInt32();
+            Samples = samples;
+            SampleRate = sampleRate;
+        }
+    }
 
-            if (chunkId == "fmt ")
+    public static class AudioIO
+    {
+        public static AudioData LoadWav(string path)
+        {
+            using var fs = File.OpenRead(path);
+            using var br = new BinaryReader(fs);
+
+            // Read RIFF header
+            string riff = new string(br.ReadChars(4));
+            if (riff != "RIFF")
+                throw new Exception("Not a valid WAV file");
+
+            br.ReadInt32(); // file size
+            string wave = new string(br.ReadChars(4));
+            if (wave != "WAVE")
+                throw new Exception("Not a valid WAV file");
+
+            // Read fmt chunk
+            string fmt = new string(br.ReadChars(4));
+            if (fmt != "fmt ")
+                throw new Exception("Expected fmt chunk");
+
+            int fmtSize = br.ReadInt32();
+            short audioFormat = br.ReadInt16();
+            short numChannels = br.ReadInt16();
+            int sampleRate = br.ReadInt32();
+            int byteRate = br.ReadInt32();
+            short blockAlign = br.ReadInt16();
+            short bitsPerSample = br.ReadInt16();
+
+            if (audioFormat != 1)
+                throw new Exception($"Unsupported audio format: {audioFormat} (only PCM supported)");
+
+            if (numChannels != 1)
+                throw new Exception($"Only mono audio supported (got {numChannels} channels)");
+
+            // Skip extra fmt bytes if present
+            if (fmtSize > 16)
+                br.ReadBytes(fmtSize - 16);
+
+            // Read data chunk
+            string data = new string(br.ReadChars(4));
+            if (data != "data")
+                throw new Exception("Expected data chunk");
+
+            int dataSize = br.ReadInt32();
+            int numSamples = dataSize / (bitsPerSample / 8);
+
+            float[] samples = new float[numSamples];
+
+            if (bitsPerSample == 16)
             {
-                short audioFormat = br.ReadInt16(); // 1 = PCM
-                channels = br.ReadInt16();
-                sampleRate = br.ReadInt32();
-                br.ReadInt32(); // Byte rate
-                br.ReadInt16(); // Block align
-                bitsPerSample = br.ReadInt16();
-                if (chunkSize > 16) br.ReadBytes(chunkSize - 16);
+                for (int i = 0; i < numSamples; i++)
+                {
+                    short sample = br.ReadInt16();
+                    samples[i] = sample / 32768.0f;
+                }
             }
-            else if (chunkId == "data")
+            else if (bitsPerSample == 24)
             {
-                dataBytes = br.ReadBytes(chunkSize);
-                break; // We found the audio samples, we can stop
+                for (int i = 0; i < numSamples; i++)
+                {
+                    byte[] bytes = br.ReadBytes(3);
+                    int sample = (bytes[2] << 16) | (bytes[1] << 8) | bytes[0];
+                    if ((sample & 0x800000) != 0)
+                        sample |= unchecked((int)0xFF000000);
+                    samples[i] = sample / 8388608.0f;
+                }
+            }
+            else if (bitsPerSample == 32)
+            {
+                for (int i = 0; i < numSamples; i++)
+                {
+                    int sample = br.ReadInt32();
+                    samples[i] = sample / 2147483648.0f;
+                }
             }
             else
             {
-                br.ReadBytes(chunkSize); // Skip metadata / LIST / INFO chunks
+                throw new Exception($"Unsupported bit depth: {bitsPerSample}");
             }
+
+            return new AudioData(samples, sampleRate);
         }
 
-        if (dataBytes == null) throw new InvalidDataException("No 'data' chunk found in WAV");
-        if (bitsPerSample != 16) throw new NotSupportedException("Only 16-bit PCM WAV files are supported");
-
-        int numSamples = dataBytes.Length / 2;
-        float[] samples = new float[numSamples];
-        for (int i = 0; i < numSamples; i++)
+        public static void SaveWav(string path, float[] samples, int sampleRate)
         {
-            short s = BitConverter.ToInt16(dataBytes, i * 2);
-            samples[i] = s / 32768f; // Normalize to [-1.0, 1.0]
-        }
+            using var fs = File.Create(path);
+            using var bw = new BinaryWriter(fs);
 
-        // Downmix stereo to mono if necessary
-        if (channels == 2)
-        {
-            float[] mono = new float[numSamples / 2];
-            for (int i = 0; i < mono.Length; i++)
+            int bitsPerSample = 16;
+            int numChannels = 1;
+            int byteRate = sampleRate * numChannels * bitsPerSample / 8;
+            short blockAlign = (short)(numChannels * bitsPerSample / 8);
+            int dataSize = samples.Length * (bitsPerSample / 8);
+            int fileSize = 36 + dataSize;
+
+            // RIFF header
+            bw.Write("RIFF".ToCharArray());
+            bw.Write(fileSize);
+            bw.Write("WAVE".ToCharArray());
+
+            // fmt chunk
+            bw.Write("fmt ".ToCharArray());
+            bw.Write(16); // fmt chunk size
+            bw.Write((short)1); // PCM
+            bw.Write((short)numChannels);
+            bw.Write(sampleRate);
+            bw.Write(byteRate);
+            bw.Write(blockAlign);
+            bw.Write((short)bitsPerSample);
+
+            // data chunk
+            bw.Write("data".ToCharArray());
+            bw.Write(dataSize);
+
+            for (int i = 0; i < samples.Length; i++)
             {
-                mono[i] = (samples[i * 2] + samples[i * 2 + 1]) / 2f;
+                float clamped = Math.Max(-1.0f, Math.Min(1.0f, samples[i]));
+                short sample = (short)(clamped * 32767.0f);
+                bw.Write(sample);
             }
-            return mono;
         }
-
-        return samples;
-    }
-
-    public static void WriteWav(string path, float[] samples, int sampleRate)
-    {
-        short[] pcm = new short[samples.Length];
-        for (int i = 0; i < samples.Length; i++)
-        {
-            float s = Math.Clamp(samples[i], -1f, 1f);
-            pcm[i] = (short)(s * 32767f);
-        }
-
-        int dataSize = pcm.Length * 2;
-        using var fs = new FileStream(path, FileMode.Create);
-        using var bw = new BinaryWriter(fs);
-
-        bw.Write(new[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F' });
-        bw.Write(36 + dataSize);
-        bw.Write(new[] { (byte)'W', (byte)'A', (byte)'V', (byte)'E' });
-        bw.Write(new[] { (byte)'f', (byte)'m', (byte)'t', (byte)' ' });
-        bw.Write(16);
-        bw.Write((short)1);
-        bw.Write((short)1);
-        bw.Write(sampleRate);
-        bw.Write(sampleRate * 2);
-        bw.Write((short)2);
-        bw.Write((short)16);
-        bw.Write(new[] { (byte)'d', (byte)'a', (byte)'t', (byte)'a' });
-        bw.Write(dataSize);
-
-        foreach (var s in pcm) bw.Write(s);
     }
 }

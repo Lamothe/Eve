@@ -1,371 +1,246 @@
 ﻿using System;
 using System.IO;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
+using System.Linq;
+using Eve.Data;
+using Eve.Native;
+using Eve.Utils;
 
-namespace Eve;
-
-class Program
+namespace Eve
 {
-    static string GetOutputDir()
+    class Program
     {
-        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        var outputDir = Path.Combine(baseDir, "..", "..", "..", "output");
-        Directory.CreateDirectory(outputDir);
-        return Path.GetFullPath(outputDir);
-    }
-
-    static void Main(string[] args)
-    {
-        if (args.Length > 0 && args[0] == "--test-native")
+        static void Main(string[] args)
         {
-            TestNative();
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--generate")
-        {
-            var count = args.Length > 1 ? int.Parse(args[1]) : 50;
-            var cfg = new Utils.Config();
-            using var gen = new Data.SyntheticDataGenerator();
-            gen.Generate(cfg, count);
-            return;
-        }
-
-        if (args.Length > 0 && args[0] == "--generate-audio")
-        {
-            var numTokens = args.Length > 1 ? int.Parse(args[1]) : 1500;
-            var temperature = args.Length > 2 ? float.Parse(args[2]) : 0.9f;
-            var promptPath = args.Length > 3 ? args[3] : null;
-            var outputPath = args.Length > 4 ? args[4] : null;
-            GenerateAudio(numTokens, temperature, promptPath, outputPath);
-            return;
-        }
-
-        var resume = args.Length > 0 && args[0] == "--resume";
-        TrainFullModel(resume);
-    }
-
-    static void TrainFullModel(bool resume)
-    {
-        var cfg = new Utils.Config();
-        Console.WriteLine("=== Full Model Training (VQ-VAE + Transformer) ===\n");
-
-        // Phase 0: Pre-encode all audio to codes
-        Console.WriteLine("Phase 0: Encoding all audio to codes...");
-        var dataset = new Data.AudioDataset(cfg.DataPath, cfg.AudioLengthSamples);
-        if (dataset.Count == 0)
-        {
-            Console.WriteLine($"\u26a0 No training data in '{cfg.DataPath}/'. Generate with: dotnet run -- --generate 100");
-            return;
-        }
-        Console.WriteLine($"Loaded {dataset.Count} audio files.\n");
-
-        // Create handle for encoding
-        using var encHandle = new Native.EveNativeHandle(
-            codebookSize: 256, latentDim: 64, embedDim: 64,
-            numHeads: 4, numLayers: 4, feedForwardDim: 256,
-            maxSeqLen: 2048, sampleRate: 24000, audioLen: 24000);
-        encHandle.InitWeights(42);
-        encHandle.SetCommitmentCost(1.0f);
-        encHandle.SetEmaDecay(0.99f);
-
-        // Encode all files to codes and save
-        string codesPath = Path.Combine(cfg.DataPath, "codes.bin");
-        Console.WriteLine($"Encoding {dataset.Count} files -> {codesPath}");
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        int totalCodes = 0;
-        int[] codeBuffer = new int[2048];
-
-        using (var fs = new FileStream(codesPath, FileMode.Create))
-        using (var bw = new BinaryWriter(fs))
-        {
-            for (int i = 0; i < dataset.Count; i++)
+            if (args.Length == 0)
             {
-                float[] audio = dataset.Get(i);
-                int numCodes = encHandle.Encode(audio, 1, 24000, codeBuffer, codeBuffer.Length);
-                if (numCodes > 0)
+                Console.WriteLine("Usage:");
+                Console.WriteLine("  eve train <audio_dir> <output_model>");
+                Console.WriteLine("  eve generate <model> <prompt_audio> <output_audio> [num_frames] [temperature]");
+                return;
+            }
+
+            string command = args[0].ToLower();
+
+            switch (command)
+            {
+                case "train":
+                    if (args.Length < 3)
+                    {
+                        Console.WriteLine("Usage: eve train <audio_dir> <output_model>");
+                        return;
+                    }
+                    Train(args[1], args[2]);
+                    break;
+
+                case "generate":
+                    if (args.Length < 4)
+                    {
+                        Console.WriteLine("Usage: eve generate <model> <prompt_audio> <output_audio> [num_frames] [temperature]");
+                        return;
+                    }
+                    int numFrames = args.Length > 4 ? int.Parse(args[4]) : 100;
+                    float temperature = args.Length > 5 ? float.Parse(args[5]) : 0.8f;
+                    Generate(args[1], args[2], args[3], numFrames, temperature);
+                    break;
+
+                default:
+                    Console.WriteLine($"Unknown command: {command}");
+                    break;
+            }
+        }
+
+        static void Train(string audioDir, string outputPath)
+        {
+            Console.WriteLine($"Training on audio from: {audioDir}");
+
+            // Configuration
+            int sampleRate = 24000;
+            int windowSize = 1024;
+            int hopSize = 256;
+            int fftSize = 1024;
+            int topK = 32;
+            int vocabSize = fftSize / 2 + 1; // 513 bins
+
+      int embedDim = 256;
+            int numHeads = 4;
+            int numLayers = 4;
+            int feedForwardDim = 1024;
+            int maxSeqLen = 128;
+
+            int numEpochs = 50;
+      float learningRate = 0.00001f;
+
+            // Initialize tokenizer
+            var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);
+
+            // Load and tokenize audio files
+            Console.WriteLine("Loading and tokenizing audio files...");
+            var audioFiles = Directory.GetFiles(audioDir, "*.wav");
+            var allTokens = new System.Collections.Generic.List<int[]>();
+
+            foreach (var file in audioFiles)
+            {
+                try
                 {
-                    bw.Write(numCodes);
-                    for (int j = 0; j < numCodes; j++)
-                        bw.Write(codeBuffer[j]);
-                    totalCodes += numCodes;
+                    var audio = AudioIO.LoadWav(file);
+                    if (audio.SampleRate != sampleRate)
+                    {
+                        continue;
+                    }
+
+                    var tokens = tokenizer.Encode(audio.Samples);
+                    allTokens.Add(tokens);
                 }
-                if ((i + 1) % 50 == 0)
-                    Console.WriteLine($"  Encoded {(i + 1)}/{dataset.Count} files...");
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  Error loading {Path.GetFileName(file)}: {ex.Message}");
+                }
             }
-        }
-        sw.Stop();
-        Console.WriteLine($"Encoded {totalCodes} total codes from {dataset.Count} files in {sw.Elapsed.TotalSeconds:F1}s\n");
 
-        // Phase 1: Train VQ-VAE
-        Console.WriteLine("=== Phase 1: Train VQ-VAE ===\n");
-        Console.WriteLine("Creating VQ-VAE handle...");
-        using var vqvae = new Native.EveNativeHandle(
-            codebookSize: 256, latentDim: 64, embedDim: 64,
-            numHeads: 4, numLayers: 4, feedForwardDim: 256,
-            maxSeqLen: 2048, sampleRate: 24000, audioLen: 24000);
-
-        if (resume)
-        {
-            var vqvaePath = Path.Combine(GetOutputDir(), "eve_vqvae_trained.bin");
-            if (File.Exists(vqvaePath))
+            if (allTokens.Count == 0)
             {
-                vqvae.LoadWeights(vqvaePath);
-                Console.WriteLine($"Loaded existing VQ-VAE weights from {vqvaePath}\n");
+                Console.WriteLine("No audio files loaded successfully");
+                return;
+            }
+
+            Console.WriteLine($"Loaded {allTokens.Count} files, total {allTokens.Sum(t => t.Length)} tokens");
+            Console.WriteLine("Initializing model...");
+            Console.Out.Flush();
+            using var model = new EveNativeHandle(vocabSize, embedDim, numHeads, numLayers,
+                                                   feedForwardDim, maxSeqLen);
+            model.InitWeights(42);
+            model.SetLearningRate(learningRate);
+
+            // Training loop
+            Console.WriteLine($"Training for {numEpochs} epochs...");
+            Console.Out.Flush();
+            int globalStep = 0;
+
+            for (int epoch = 0; epoch < numEpochs; epoch++)
+            {
+                Console.WriteLine($"Epoch {epoch + 1}/{numEpochs} starting...");
+                Console.Out.Flush();
+                float epochLoss = 0.0f;
+                int epochSteps = 0;
+
+                // Shuffle files
+                var shuffled = allTokens.OrderBy(x => Guid.NewGuid()).ToList();
+
+            foreach (var tokens in shuffled)
+            {
+                // Split into chunks of maxSeqLen
+                for (int start = 0; start < tokens.Length - maxSeqLen; start += maxSeqLen / 2)
+                {
+                    int chunkLen = Math.Min(maxSeqLen, tokens.Length - start);
+                    if (chunkLen < 2) continue;
+
+                    var chunk = new int[chunkLen];
+                    Array.Copy(tokens, start, chunk, 0, chunkLen);
+
+                    float loss = model.TrainStep(chunk, chunkLen);
+                    epochLoss += loss;
+                    epochSteps++;
+                    globalStep++;
+
+                    if (globalStep % 10 == 0)
+                    {
+                        Console.WriteLine($"  Step {globalStep}: loss = {loss:F4}");
+                    }
+                }
+            }
+
+                float avgLoss = epochSteps > 0 ? epochLoss / epochSteps : 0.0f;
+                Console.WriteLine($"Epoch {epoch + 1}/{numEpochs}: avg loss = {avgLoss:F4}");
+            }
+
+            // Save model
+            int saveResult = model.SaveModel(outputPath);
+            if (saveResult == 0)
+            {
+                Console.WriteLine($"Model saved to: {outputPath}");
             }
             else
             {
-                Console.WriteLine("No existing VQ-VAE weights found, training from scratch.\n");
-                vqvae.InitWeights(42);
+                Console.WriteLine($"Failed to save model (error {saveResult})");
             }
-        }
-        else
-        {
-            vqvae.InitWeights(42);
+            Console.WriteLine("Training complete.");
         }
 
-        vqvae.SetLearningRate(1e-4f);
-        vqvae.SetCommitmentCost(1.0f);
-        vqvae.SetEmaDecay(0.99f);
-
-        int vqvaeSteps = 5000;
-        float[] audioBuffer = new float[24000];
-        sw = System.Diagnostics.Stopwatch.StartNew();
-
-        for (int step = 0; step < vqvaeSteps; step++)
+       static void Generate(string modelPath, string promptPath, string outputPath,
+                            int numFrames, float temperature)
         {
-            int fileIdx = Random.Shared.Next(dataset.Count);
-            float[] audio = dataset.Get(fileIdx);
-            Array.Copy(audio, audioBuffer, 24000);
+            Console.WriteLine($"Generating from prompt: {promptPath}");
 
-            float loss = vqvae.TrainVqVaeStep(audioBuffer, 1, 24000);
+            // Configuration (must match training)
+            int sampleRate = 24000;
+            int windowSize = 1024;
+            int hopSize = 256;
+            int fftSize = 1024;
+            int topK = 32;
+            int vocabSize = fftSize / 2 + 1;
 
-            if (step % 500 == 0 || step == vqvaeSteps - 1)
+            int embedDim = 128;
+            int numHeads = 4;
+            int numLayers = 2;
+            int feedForwardDim = 512;
+            int maxSeqLen = 64;
+
+            // Initialize tokenizer
+            var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);
+
+            // Load prompt audio
+            var promptAudio = AudioIO.LoadWav(promptPath);
+            if (promptAudio.SampleRate != sampleRate)
             {
-                double elapsed = sw.Elapsed.TotalSeconds;
-                Console.WriteLine($"  VQ-VAE Step {step,4}/{vqvaeSteps}  loss={loss:F6}  ({elapsed / (step + 1) * 1000:F1} ms/step)");
+                Console.WriteLine($"Error: prompt sample rate {promptAudio.SampleRate} != {sampleRate}");
+                return;
             }
-        }
-        sw.Stop();
-        Console.WriteLine($"\nVQ-VAE training done: {sw.Elapsed.TotalSeconds:F1}s\n");
 
-        // Save VQ-VAE weights
-        string outputDir = GetOutputDir();
-        string vqvaeSavePath = Path.Combine(outputDir, "eve_vqvae_trained.bin");
-        vqvae.SaveWeights(vqvaeSavePath);
-        Console.WriteLine($"Saved VQ-VAE weights to {vqvaeSavePath}\n");
+            // Tokenize prompt
+            var promptTokens = tokenizer.Encode(promptAudio.Samples);
+            Console.WriteLine($"Prompt: {promptAudio.Samples.Length} samples -> {promptTokens.Length} tokens");
 
-        // Phase 2: Train Transformer
-        Console.WriteLine("=== Phase 2: Train Transformer ===\n");
-        Console.WriteLine("Creating Transformer handle...");
-        using var transformer = new Native.EveNativeHandle(
-            codebookSize: 256, latentDim: 64, embedDim: 512,
-            numHeads: 8, numLayers: 6, feedForwardDim: 2048,
-            maxSeqLen: 2048, sampleRate: 24000, audioLen: 24000);
-
-        if (resume)
-        {
-            var transPath = Path.Combine(outputDir, "eve_transformer_trained.bin");
-            if (File.Exists(transPath))
+            // Initialize model
+            Console.WriteLine("Loading model...");
+            using var model = new EveNativeHandle(vocabSize, embedDim, numHeads, numLayers,
+                                                    feedForwardDim, maxSeqLen);
+            int loadResult = model.LoadModel(modelPath);
+            if (loadResult == 0)
             {
-                transformer.LoadWeights(transPath);
-                Console.WriteLine($"Loaded existing Transformer weights from {transPath}\n");
+                Console.WriteLine("Model loaded successfully");
             }
             else
             {
-                Console.WriteLine("No existing Transformer weights found, training from scratch.\n");
-                transformer.InitWeights(42);
+                Console.WriteLine($"Failed to load model (error {loadResult}), using random weights");
+                model.InitWeights(42);
             }
+
+            // Generate tokens
+            Console.WriteLine($"Generating {numFrames} frames ({numFrames * topK} tokens)...");
+            int numTokensToGenerate = numFrames * topK;
+            var outputTokens = new int[numTokensToGenerate];
+
+            // Use last maxSeqLen/2 tokens as prompt
+            int promptLen = Math.Min(promptTokens.Length, maxSeqLen / 2);
+            var prompt = new int[promptLen];
+            Array.Copy(promptTokens, promptTokens.Length - promptLen, prompt, 0, promptLen);
+
+            int generated = model.Generate(prompt, promptLen, outputTokens, numTokensToGenerate, temperature);
+            Console.WriteLine($"Generated {generated} tokens");
+
+            // Combine prompt and generated tokens
+            var allTokens = new int[promptLen + generated];
+            Array.Copy(prompt, 0, allTokens, 0, promptLen);
+            Array.Copy(outputTokens, 0, allTokens, promptLen, generated);
+
+            // Decode to audio
+            Console.WriteLine("Decoding to audio...");
+            int totalFrames = allTokens.Length / topK;
+            var audio = tokenizer.Decode(allTokens, totalFrames);
+
+            // Save output
+            AudioIO.SaveWav(outputPath, audio, sampleRate);
+            Console.WriteLine($"Saved {audio.Length} samples to {outputPath}");
         }
-        else
-        {
-            transformer.InitWeights(42);
-        }
-
-        transformer.SetLearningRate(3e-4f);
-        Console.WriteLine("Initialized Transformer weights.\n");
-
-        // Load codes and train
-        Console.WriteLine($"Loading codes from {codesPath}...");
-        List<int> allCodesList = new();
-        List<int> seqLensList = new();
-        using (var fs = new FileStream(codesPath, FileMode.Open))
-        using (var br = new BinaryReader(fs))
-        {
-            while (br.BaseStream.Position < br.BaseStream.Length)
-            {
-                int len = br.ReadInt32();
-                if (len <= 0 || len > 2048) break;
-                seqLensList.Add(len);
-                for (int j = 0; j < len; j++)
-                    allCodesList.Add(br.ReadInt32());
-            }
-        }
-        int[] allCodes = allCodesList.ToArray();
-        int[] allSeqLens = seqLensList.ToArray();
-        Console.WriteLine($"Loaded {allCodes.Length} total codes across {allSeqLens.Length} sequences.\n");
-
-        int transSteps = 10000;
-        int batchSize = 1;
-        sw = System.Diagnostics.Stopwatch.StartNew();
-        int codeOffset = 0;
-
-        for (int step = 0; step < transSteps; step++)
-        {
-            // Pick a random sequence
-            int seqIdx = Random.Shared.Next(allSeqLens.Length);
-            int seqLen = allSeqLens[seqIdx];
-            if (seqLen < 32) { step--; continue; }  // Skip too-short sequences
-
-            int[] seqCodes = new int[seqLen];
-            Array.Copy(allCodes, codeOffset, seqCodes, 0, seqLen);
-            codeOffset = (codeOffset / 4 + 1) * 4;  // Move to next sequence
-
-            float loss = transformer.TrainTransformerStep(seqCodes, batchSize, seqLen);
-
-            if (step % 500 == 0 || step == transSteps - 1)
-            {
-                double elapsed = sw.Elapsed.TotalSeconds;
-                Console.WriteLine($"  Transformer Step {step,4}/{transSteps}  loss={loss:F6}  ({elapsed / (step + 1) * 1000:F1} ms/step)");
-            }
-        }
-        sw.Stop();
-        Console.WriteLine($"\nTransformer training done: {sw.Elapsed.TotalSeconds:F1}s\n");
-
-        // Save Transformer weights
-        string transSavePath = Path.Combine(outputDir, "eve_transformer_trained.bin");
-        transformer.SaveWeights(transSavePath);
-        Console.WriteLine($"Saved Transformer weights to {transSavePath}");
-        Console.WriteLine("\n=== Full training pipeline complete! ===");
-    }
-
-    static void GenerateAudio(int numTokens, float temperature, string? promptPath, string? outputPath)
-    {
-        Console.WriteLine("=== Audio Generation ===\n");
-        Console.WriteLine($"Tokens: {numTokens}, Temperature: {temperature}");
-
-        // Load trained weights
-        string outputDir = GetOutputDir();
-        string vqvaePath = Path.Combine(outputDir, "eve_vqvae_trained.bin");
-        string transPath = Path.Combine(outputDir, "eve_transformer_trained.bin");
-
-        if (!File.Exists(vqvaePath) || !File.Exists(transPath))
-        {
-            Console.WriteLine("Error: trained weights not found. Run training first with: dotnet run");
-            return;
-        }
-
-        // Create VQ-VAE handle for encoding prompt and decoding output
-        using var vqvae = new Native.EveNativeHandle(
-            codebookSize: 256, latentDim: 64, embedDim: 64,
-            numHeads: 4, numLayers: 4, feedForwardDim: 256,
-            maxSeqLen: 2048, sampleRate: 24000, audioLen: 24000);
-        vqvae.LoadWeights(vqvaePath);
-
-        // Create Transformer handle for generation
-        using var transformer = new Native.EveNativeHandle(
-            codebookSize: 256, latentDim: 64, embedDim: 512,
-            numHeads: 8, numLayers: 6, feedForwardDim: 2048,
-            maxSeqLen: 2048, sampleRate: 24000, audioLen: 24000);
-        transformer.LoadWeights(transPath);
-
-        float[]? promptAudio = null;
-        if (promptPath != null && File.Exists(promptPath))
-        {
-            Console.WriteLine($"Loading prompt audio from {promptPath}...");
-            promptAudio = Utils.AudioIO.ReadWav(promptPath, out int _);
-            Console.WriteLine($"Prompt audio: {promptAudio.Length} samples\n");
-        }
-        else
-        {
-            Console.WriteLine("No prompt provided, generating from scratch.\n");
-        }
-
-        // Generate audio
-        int maxOutputSamples = 24000 * 10;  // Up to 10 seconds
-        float[] outputAudio = new float[maxOutputSamples];
-        int promptLen = promptAudio != null ? promptAudio.Length : 0;
-
-        Console.WriteLine("Generating...");
-        int actualLen = transformer.Generate(
-            promptAudio ?? Array.Empty<float>(),
-            promptLen,
-            numTokens,
-            temperature,
-            outputAudio,
-            outputAudio.Length);
-
-        // Write output WAV file
-        string outPath = outputPath ?? Path.Combine(outputDir, "generated_output.wav");
-        Utils.AudioIO.WriteWav(outPath, outputAudio, 24000);
-        Console.WriteLine($"\nGenerated {actualLen} samples ({actualLen / 24000.0:F2}s) -> {outPath}");
-    }
-
-    static void TestNative()
-    {
-        Console.WriteLine("Testing Eve.Native P/Invoke wrapper...\n");
-
-        using var eve = new Native.EveNativeHandle(
-            codebookSize: 1024,
-            latentDim: 64,
-            embedDim: 512,
-            numHeads: 8,
-            numLayers: 6,
-            feedForwardDim: 2048,
-            maxSeqLen: 8192,
-            sampleRate: 24000,
-            audioLen: 120000
-        );
-        Console.WriteLine("1. Created handle.");
-
-        eve.InitWeights(42);
-        Console.WriteLine("2. Initialized weights.");
-
-        float[] audio = new float[120000];
-        for (int i = 0; i < audio.Length; i++)
-            audio[i] = 0.5f * MathF.Sin(2 * MathF.PI * 440.0f * i / 24000.0f);
-        Console.WriteLine("3. Created sine wave audio.");
-
-        float[] z = new float[120000 * 64];
-        int zLen = eve.EncoderForward(audio, 1, audio.Length, z, z.Length);
-        float[] zOrig = (float[])z.Clone();
-        Console.WriteLine($"4. Encoder forward: seq_len={zLen}, z[0..4]={z[0]:F6} {z[1]:F6} {z[2]:F6} {z[3]:F6} {z[4]:F6}");
-
-        int[] codes = new int[zLen];
-        float[] qz = new float[z.Length];
-        eve.Quantize(z, 1, zLen, codes, qz, qz.Length);
-        Console.WriteLine($"5. Quantize: codes[0..4]={codes[0]} {codes[1]} {codes[2]} {codes[3]} {codes[4]}");
-
-        int[] codes2 = new int[10000];
-        int n2 = eve.Encode(audio, 1, audio.Length, codes2, codes2.Length);
-        Console.WriteLine($"6. Eve.Encode: {n2} codes, first 5={codes2[0]} {codes2[1]} {codes2[2]} {codes2[3]} {codes2[4]}");
-
-        float[] recon = new float[120000];
-        eve.DecoderForward(qz, 1, zLen, recon, recon.Length);
-        Console.WriteLine($"7. Decoder forward: recon[0..4]={recon[0]:F6} {recon[1]:F6} {recon[2]:F6} {recon[3]:F6} {recon[4]:F6}");
-
-        string testOutputDir = GetOutputDir();
-        string csharpWeightsPath = Path.Combine(testOutputDir, "eve_csharp_weights.bin");
-        eve.SaveWeights(csharpWeightsPath);
-        Console.WriteLine($"8. Saved weights to {csharpWeightsPath}.");
-
-        using var eve2 = new Native.EveNativeHandle(1024, 64, 512, 8, 6, 2048, 8192, 24000, 120000);
-        eve2.LoadWeights(csharpWeightsPath);
-        Console.WriteLine("9. Loaded weights into new handle.");
-
-        float[] z2 = new float[120000 * 64];
-        int zLen2 = eve2.EncoderForward(audio, 1, audio.Length, z2, z2.Length);
-        Console.WriteLine($"10. Reloaded encoder: z[0..4]={z2[0]:F6} {z2[1]:F6} {z2[2]:F6} {z2[3]:F6} {z2[4]:F6}");
-
-        float diff = Math.Abs(zOrig[0] - z2[0]);
-        Console.WriteLine($"    diff={diff:E}, zOrig[0]={zOrig[0]:E}, z2[0]={z2[0]:E}");
-
-        int mismatches = 0;
-        for (int i = 0; i < zLen && i < zLen2; i++)
-            if (Math.Abs(zOrig[i] - z2[i]) > 1e-6f) mismatches++;
-        Console.WriteLine($"    Total mismatches (eps=1e-6): {mismatches} / {zLen}");
-
-        Console.WriteLine("\nAll C# P/Invoke tests passed!");
     }
 }
