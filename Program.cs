@@ -69,15 +69,15 @@ namespace Eve
             int topK = 32;
             int vocabSize = fftSize / 2 + 1; // 513 bins
 
-            int embedDim = 256;
+      int embedDim = 256;
             int numHeads = 4;
             int numLayers = 4;
             int feedForwardDim = 1024;
             int maxSeqLen = 128;
 
             int numEpochs = 50;
-            int checkpointEvery = 5; // Save checkpoint every N epochs
-            float learningRate = 0.00001f;
+            int checkpointEvery = 5;
+      float learningRate = 0.0000001f; // Reduced to 1e-7 for stability
 
             // Initialize tokenizer
             var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);

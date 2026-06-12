@@ -88,6 +88,9 @@ struct eve_handle {
     // Optimizer params tensor (for ggml_opt_step_adamw)
     struct ggml_tensor * opt_params;
 
+    // Causal attention mask
+    struct ggml_tensor * causal_mask;
+
     // All weight tensors in ordered list
     struct ggml_tensor ** all_weights;
     int num_weight_tensors;
@@ -294,7 +297,10 @@ eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_la
     // Create optimizer params tensor (7 floats: alpha, beta1, beta2, eps, wd, beta1h, beta2h)
     h->opt_params = ggml_new_tensor_1d(h->weight_ctx, GGML_TYPE_F32, 7);
 
-    // Allocate all tensors (weights + moments) on Vulkan backend for GPU training
+    // Create causal attention mask (max_seq_len x max_seq_len)
+    h->causal_mask = ggml_new_tensor_2d(h->weight_ctx, GGML_TYPE_F32, max_seq_len, max_seq_len);
+
+    // Allocate all tensors (weights + moments + mask) on Vulkan backend for GPU training
     h->weight_buf = ggml_backend_alloc_ctx_tensors(h->weight_ctx, h->vk_backend);
     if (!h->weight_buf) {
         fprintf(stderr, "Failed to allocate weight tensors on Vulkan backend\n");
@@ -302,6 +308,16 @@ eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_la
         free(h);
         return NULL;
     }
+
+    // Initialize causal mask: 0 for allowed positions, -inf for future positions
+    float * mask_data = (float *)malloc(max_seq_len * max_seq_len * sizeof(float));
+    for (int q_pos = 0; q_pos < max_seq_len; q_pos++) {
+        for (int k_pos = 0; k_pos < max_seq_len; k_pos++) {
+            mask_data[q_pos * max_seq_len + k_pos] = (k_pos > q_pos) ? -INFINITY : 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(h->causal_mask, mask_data, 0, max_seq_len * max_seq_len * sizeof(float));
+    free(mask_data);
 
     // Initialize moment tensors to zero
     for (int i = 0; i < h->num_weight_tensors; i++) {
@@ -373,12 +389,13 @@ void eve_set_learning_rate(eve_handle * h, float lr) {
     h->adamw_alpha = lr;
 }
 
-// Forward pass through transformer (FFN layers, attention added later)
+// Forward pass through transformer with multi-head self-attention
 static struct ggml_tensor * transformer_forward(
     struct ggml_context * ctx,
     struct eve_handle * h,
     struct ggml_tensor * tokens,
-    struct ggml_tensor * positions)
+    struct ggml_tensor * positions,
+    int seq_len)
 {
     // Token embedding
     struct ggml_tensor * x = ggml_get_rows(ctx, h->trans_token_emb, tokens);
@@ -387,8 +404,68 @@ static struct ggml_tensor * transformer_forward(
     struct ggml_tensor * pos_emb = ggml_get_rows(ctx, h->trans_pos_emb, positions);
     x = ggml_add(ctx, x, pos_emb);
 
+    int head_dim = h->embed_dim / h->num_heads;
+    float kq_scale = 1.0f / sqrtf((float)head_dim);
+
     for (int layer = 0; layer < h->num_layers; layer++) {
-        // Pre-norm feedforward block
+        // === Self-attention block ===
+        struct ggml_tensor * attn_residual = x;
+
+        // Pre-norm
+        x = ggml_rms_norm(ctx, x, 1e-5f);
+        x = ggml_mul(ctx, x, h->trans_attn_norm_w[layer]);
+        x = ggml_add(ctx, x, h->trans_attn_norm_b[layer]);
+
+        // QKV projections: (embed_dim, seq_len)
+        struct ggml_tensor * q = ggml_mul_mat(ctx, h->trans_wq[layer], x);
+        q = ggml_add(ctx, q, h->trans_bq[layer]);
+        struct ggml_tensor * k = ggml_mul_mat(ctx, h->trans_wk[layer], x);
+        k = ggml_add(ctx, k, h->trans_bk[layer]);
+        struct ggml_tensor * v = ggml_mul_mat(ctx, h->trans_wv[layer], x);
+        v = ggml_add(ctx, v, h->trans_bv[layer]);
+
+        // Reshape to expose heads: (head_dim, num_heads, seq_len)
+        q = ggml_reshape_3d(ctx, q, head_dim, h->num_heads, seq_len);
+        k = ggml_reshape_3d(ctx, k, head_dim, h->num_heads, seq_len);
+        v = ggml_reshape_3d(ctx, v, head_dim, h->num_heads, seq_len);
+
+        // Permute to (head_dim, seq_len, num_heads) so ggml_mul_mat broadcasts over heads
+        q = ggml_permute(ctx, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+
+        // Attention scores: K^T @ Q -> (seq_len, seq_len, num_heads)
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+
+        // Causal mask view for current seq_len (must be contiguous for soft_max_ext)
+        struct ggml_tensor * mask = ggml_view_2d(ctx, h->causal_mask,
+            seq_len, seq_len, h->causal_mask->nb[1], 0);
+        mask = ggml_cont(ctx, mask);
+
+        // Fused scale + mask + softmax
+        kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, 0.0f);
+
+        // V handling: permute to (head_dim, seq_len, num_heads), then transpose to (seq_len, head_dim, num_heads)
+        // llama.cpp stores V transposed in KV cache; we do it explicitly here
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);  // (head_dim, num_heads, seq_len) -> (head_dim, seq_len, num_heads)
+        v = ggml_cont(ctx, ggml_transpose(ctx, v));  // -> (seq_len, head_dim, num_heads)
+
+        // kqv = V^T @ softmax(KQ) -> (head_dim, seq_len, num_heads)
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+
+        // Permute back: (head_dim, seq_len, num_heads) -> (head_dim, num_heads, seq_len)
+        kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+
+        // Flatten heads: (head_dim, num_heads, seq_len) -> (embed_dim, seq_len)
+        struct ggml_tensor * attn_out = ggml_cont_2d(ctx, kqv, h->embed_dim, seq_len);
+
+        // Output projection
+        attn_out = ggml_mul_mat(ctx, h->trans_wo[layer], attn_out);
+        attn_out = ggml_add(ctx, attn_out, h->trans_bo[layer]);
+
+        // Residual
+        x = ggml_add(ctx, attn_out, attn_residual);
+
+        // === FFN block ===
         struct ggml_tensor * residual = x;
         x = ggml_rms_norm(ctx, x, 1e-5f);
         x = ggml_mul(ctx, x, h->trans_ffn_norm_w[layer]);
@@ -435,7 +512,7 @@ float eve_train_step(eve_handle * h, int * tokens, int seq_len) {
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len - 1);
 
     // Forward pass through transformer
-    struct ggml_tensor * logits = transformer_forward(ctx, h, input_tokens, positions);
+    struct ggml_tensor * logits = transformer_forward(ctx, h, input_tokens, positions, seq_len - 1);
 
     // Decompose cross-entropy into Vulkan-supported ops:
     // CE = -sum(targets * log(softmax(logits)))
@@ -548,7 +625,7 @@ int eve_generate(eve_handle * h, int * prompt_tokens, int prompt_len,
         struct ggml_tensor * input_tokens = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, seq_len);
         struct ggml_tensor * positions = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, seq_len);
 
-        struct ggml_tensor * logits = transformer_forward(c.ctx, h, input_tokens, positions);
+        struct ggml_tensor * logits = transformer_forward(c.ctx, h, input_tokens, positions, seq_len);
         ggml_build_forward_expand(c.gf, logits);
 
         if (!compute_alloc(&c, h->vk_backend)) {
