@@ -15,12 +15,12 @@
 
   <Target Name="CopyNativeLibs" AfterTargets="Build">
     <Exec Command="cp $(MSBuildProjectDirectory)/lib/libeve_native.so $(TargetDir)" />
-    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-base.so.0.13.1 $(TargetDir)" />
-    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-cpu.so.0.13.1 $(TargetDir)" />
-    <Exec Command="cp $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-vulkan.so.0.13.1 $(TargetDir)" />
-    <Exec Command="ln -sf libggml-base.so.0.13.1 $(TargetDir)libggml-base.so.0; ln -sf libggml-base.so.0 $(TargetDir)libggml-base.so || true" />
-    <Exec Command="ln -sf libggml-cpu.so.0.13.1 $(TargetDir)libggml-cpu.so.0; ln -sf libggml-cpu.so.0 $(TargetDir)libggml-cpu.so || true" />
-    <Exec Command="ln -sf libggml-vulkan.so.0.13.1 $(TargetDir)libggml-vulkan.so.0; ln -sf libggml-vulkan.so.0 $(TargetDir)libggml-vulkan.so || true" />
+    <Exec Command="cp -L $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-base.so $(TargetDir)libggml-base.so.0.15.1" />
+    <Exec Command="cp -L $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-cpu.so $(TargetDir)libggml-cpu.so.0.15.1" />
+    <Exec Command="cp -L $(MSBuildProjectDirectory)/../llama.cpp/build/bin/libggml-vulkan.so $(TargetDir)libggml-vulkan.so.0.15.1" />
+    <Exec Command="ln -sf libggml-base.so.0.15.1 $(TargetDir)libggml-base.so.0; ln -sf libggml-base.so.0 $(TargetDir)libggml-base.so || true" />
+    <Exec Command="ln -sf libggml-cpu.so.0.15.1 $(TargetDir)libggml-cpu.so.0; ln -sf libggml-cpu.so.0 $(TargetDir)libggml-cpu.so || true" />
+    <Exec Command="ln -sf libggml-vulkan.so.0.15.1 $(TargetDir)libggml-vulkan.so.0; ln -sf libggml-vulkan.so.0 $(TargetDir)libggml-vulkan.so || true" />
   </Target>
 
 </Project>
