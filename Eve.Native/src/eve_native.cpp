@@ -40,9 +40,14 @@ struct eve_handle {
     int num_layers;
     int feed_forward_dim;
     int max_seq_len;
+    int voice_embed_dim;
 
     // Transformer weights: token embedding (vocab_size x embed_dim)
     struct ggml_tensor * trans_token_emb;
+
+    // Voice conditioning: style embedding -> projected to embed_dim
+    struct ggml_tensor * voice_proj_w; // [embed_dim, voice_embed_dim]
+    struct ggml_tensor * voice_proj_b; // [embed_dim]
 
     // Transformer weights: positional embedding
     struct ggml_tensor * trans_pos_emb;
@@ -147,7 +152,7 @@ static void add_weight(struct eve_handle * h, struct ggml_tensor * tensor) {
 }
 
 eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_layers,
-                        int feed_forward_dim, int max_seq_len) {
+                        int feed_forward_dim, int max_seq_len, int voice_embed_dim) {
     eve_handle * h = (eve_handle *)calloc(1, sizeof(eve_handle));
 
  // Initialize backends - use CPU for training (Vulkan lacks cross-entropy support)
@@ -179,6 +184,7 @@ eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_la
     h->num_layers = num_layers;
     h->feed_forward_dim = feed_forward_dim;
     h->max_seq_len = max_seq_len;
+    h->voice_embed_dim = voice_embed_dim;
 
     // Create token embedding
     h->trans_token_emb = ggml_new_tensor_2d(h->weight_ctx, GGML_TYPE_F32, embed_dim, vocab_size);
@@ -253,8 +259,14 @@ eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_la
     h->trans_lm_head_b = ggml_new_tensor_1d(h->weight_ctx, GGML_TYPE_F32, vocab_size);
     ggml_set_param(h->trans_lm_head_b);
 
+    // Create voice projection: style_embedding -> broadcast additive embedding
+    h->voice_proj_w = ggml_new_tensor_2d(h->weight_ctx, GGML_TYPE_F32, embed_dim, voice_embed_dim);
+    ggml_set_param(h->voice_proj_w);
+    h->voice_proj_b = ggml_new_tensor_1d(h->weight_ctx, GGML_TYPE_F32, embed_dim);
+    ggml_set_param(h->voice_proj_b);
+
     // Allocate weight tracking arrays
-    int num_weights = 2 + num_layers * 16 + 2 + 2; // token_emb, pos_emb, layers, final_norm, lm_head
+    int num_weights = 2 + num_layers * 16 + 2 + 2 + 2; // token_emb, pos_emb, layers, final_norm, lm_head, voice_proj
     h->all_weights = (struct ggml_tensor **)calloc(num_weights, sizeof(struct ggml_tensor *));
     h->m_tensors = (struct ggml_tensor **)calloc(num_weights, sizeof(struct ggml_tensor *));
     h->v_tensors = (struct ggml_tensor **)calloc(num_weights, sizeof(struct ggml_tensor *));
@@ -285,6 +297,8 @@ eve_handle * eve_create(int vocab_size, int embed_dim, int num_heads, int num_la
     add_weight(h, h->trans_final_norm_b);
     add_weight(h, h->trans_lm_head);
     add_weight(h, h->trans_lm_head_b);
+    add_weight(h, h->voice_proj_w);
+    add_weight(h, h->voice_proj_b);
 
     // Initialize AdamW parameters
     h->adamw_alpha = 0.001f;
@@ -390,11 +404,13 @@ void eve_set_learning_rate(eve_handle * h, float lr) {
 }
 
 // Forward pass through transformer with multi-head self-attention
+// voice_embed: (voice_embed_dim,) or NULL for no conditioning
 static struct ggml_tensor * transformer_forward(
     struct ggml_context * ctx,
     struct eve_handle * h,
     struct ggml_tensor * tokens,
     struct ggml_tensor * positions,
+    struct ggml_tensor * voice_embed,
     int seq_len)
 {
     // Token embedding
@@ -403,6 +419,15 @@ static struct ggml_tensor * transformer_forward(
     // Add positional embedding
     struct ggml_tensor * pos_emb = ggml_get_rows(ctx, h->trans_pos_emb, positions);
     x = ggml_add(ctx, x, pos_emb);
+
+    // Add voice conditioning: project style embedding and broadcast across sequence
+    if (voice_embed != NULL) {
+        struct ggml_tensor * voice_bias = ggml_mul_mat(ctx, h->voice_proj_w, voice_embed);
+        voice_bias = ggml_add(ctx, voice_bias, h->voice_proj_b);  // (embed_dim,)
+        voice_bias = ggml_cont(ctx, ggml_reshape_2d(ctx, voice_bias, h->embed_dim, 1));
+        struct ggml_tensor * voice_col = ggml_repeat(ctx, voice_bias, x);  // (embed_dim, seq_len)
+        x = ggml_add(ctx, x, voice_col);
+    }
 
     int head_dim = h->embed_dim / h->num_heads;
     float kq_scale = 1.0f / sqrtf((float)head_dim);
@@ -492,7 +517,8 @@ static struct ggml_tensor * transformer_forward(
     return x;
 }
 
-float eve_train_step(eve_handle * h, int * tokens, int seq_len) {
+float eve_train_step(eve_handle * h, int * tokens, int seq_len,
+                    int * voice_tokens, int voice_len) {
     if (seq_len < 2) return 0.0f;
 
     // Create a fresh context for this training step's computation graph
@@ -507,12 +533,31 @@ float eve_train_step(eve_handle * h, int * tokens, int seq_len) {
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 2, true);
 
+    // Compute voice embedding: look up token embeddings for voice prompt and mean-pool
+    struct ggml_tensor * voice_embed = NULL;
+    struct ggml_tensor * voice_token_tensor = NULL;
+    struct ggml_tensor * ones_vec = NULL;
+    float * ones_data = NULL;
+    if (voice_tokens != NULL && voice_len > 0) {
+        voice_token_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, voice_len);
+        struct ggml_tensor * voice_emb_rows = ggml_get_rows(ctx, h->trans_token_emb, voice_token_tensor);
+        // voice_emb_rows: (embed_dim, voice_len) in column-major
+        // Mean over voice_len: transpose to (voice_len, embed_dim), then matmul with ones vec
+        struct ggml_tensor * voice_emb_t = ggml_cont(ctx, ggml_transpose(ctx, voice_emb_rows));
+        ones_vec = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, voice_len);
+        // Allocate ones data and defer setting until tensor is allocated
+        ones_data = (float *)malloc(voice_len * sizeof(float));
+        for (int i = 0; i < voice_len; i++) ones_data[i] = 1.0f;
+        struct ggml_tensor * voice_sum = ggml_mul_mat(ctx, voice_emb_t, ones_vec);
+        voice_embed = ggml_scale(ctx, voice_sum, 1.0f / (float)voice_len);
+    }
+
     // Input tokens (all but last)
     struct ggml_tensor * input_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len - 1);
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len - 1);
 
-    // Forward pass through transformer
-    struct ggml_tensor * logits = transformer_forward(ctx, h, input_tokens, positions, seq_len - 1);
+    // Forward pass through transformer (with voice conditioning)
+    struct ggml_tensor * logits = transformer_forward(ctx, h, input_tokens, positions, voice_embed, seq_len - 1);
 
     // Decompose cross-entropy into Vulkan-supported ops:
     // CE = -sum(targets * log(softmax(logits)))
@@ -581,6 +626,17 @@ float eve_train_step(eve_handle * h, int * tokens, int seq_len) {
         ggml_backend_tensor_set(positions, &i, i * sizeof(int32_t), sizeof(int32_t));
     }
 
+    // Set voice prompt data
+    if (voice_token_tensor != NULL) {
+        ggml_backend_tensor_set(voice_token_tensor, voice_tokens, 0, voice_len * sizeof(int32_t));
+    }
+
+    // Set ones vector data (for voice embedding mean pooling)
+    if (ones_vec != NULL && ones_data != NULL) {
+        ggml_backend_tensor_set(ones_vec, ones_data, 0, voice_len * sizeof(float));
+        free(ones_data);
+    }
+
     // Set target data
     ggml_backend_tensor_set(target_labels, label_data, 0, h->vocab_size * (seq_len - 1) * sizeof(float));
     free(label_data);
@@ -605,7 +661,8 @@ float eve_train_step(eve_handle * h, int * tokens, int seq_len) {
     return loss_val;
 }
 
-int eve_generate(eve_handle * h, int * prompt_tokens, int prompt_len,
+int eve_generate(eve_handle * h, int * voice_tokens, int voice_len,
+                 int * prompt_tokens, int prompt_len,
                  int * output_tokens, int max_output_len, float temperature) {
     int generated = 0;
     int * current_tokens = (int *)malloc((prompt_len + max_output_len) * sizeof(int));
@@ -625,7 +682,24 @@ int eve_generate(eve_handle * h, int * prompt_tokens, int prompt_len,
         struct ggml_tensor * input_tokens = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, seq_len);
         struct ggml_tensor * positions = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, seq_len);
 
-        struct ggml_tensor * logits = transformer_forward(c.ctx, h, input_tokens, positions, seq_len);
+        // Compute voice embedding from voice prompt
+        struct ggml_tensor * voice_embed = NULL;
+        struct ggml_tensor * voice_token_tensor = NULL;
+        struct ggml_tensor * ones_vec = NULL;
+        float * ones_data = NULL;
+        if (voice_tokens != NULL && voice_len > 0) {
+            voice_token_tensor = ggml_new_tensor_1d(c.ctx, GGML_TYPE_I32, voice_len);
+            struct ggml_tensor * voice_emb_rows = ggml_get_rows(c.ctx, h->trans_token_emb, voice_token_tensor);
+            // Mean over voice_len: transpose + matmul with ones
+            struct ggml_tensor * voice_emb_t = ggml_cont(c.ctx, ggml_transpose(c.ctx, voice_emb_rows));
+            ones_vec = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, voice_len);
+            ones_data = (float *)malloc(voice_len * sizeof(float));
+            for (int i = 0; i < voice_len; i++) ones_data[i] = 1.0f;
+            struct ggml_tensor * voice_sum = ggml_mul_mat(c.ctx, voice_emb_t, ones_vec);
+            voice_embed = ggml_scale(c.ctx, voice_sum, 1.0f / (float)voice_len);
+        }
+
+        struct ggml_tensor * logits = transformer_forward(c.ctx, h, input_tokens, positions, voice_embed, seq_len);
         ggml_build_forward_expand(c.gf, logits);
 
         if (!compute_alloc(&c, h->vk_backend)) {
@@ -633,10 +707,20 @@ int eve_generate(eve_handle * h, int * prompt_tokens, int prompt_len,
             break;
         }
 
-        // Set input data (use tokens from start_pos)
+        // Set input data
         ggml_backend_tensor_set(input_tokens, &current_tokens[start_pos], 0, seq_len * sizeof(int32_t));
         for (int j = 0; j < seq_len; j++) {
             ggml_backend_tensor_set(positions, &j, j * sizeof(int32_t), sizeof(int32_t));
+        }
+
+        // Set voice prompt data
+        if (voice_token_tensor != NULL) {
+            ggml_backend_tensor_set(voice_token_tensor, voice_tokens, 0, voice_len * sizeof(int32_t));
+        }
+
+        // Set ones vector data for voice embedding mean pooling
+        if (ones_vec != NULL && ones_data != NULL) {
+            ggml_backend_tensor_set(ones_vec, ones_data, 0, voice_len * sizeof(float));
         }
 
         if (!compute_exec(&c, h->vk_backend)) {

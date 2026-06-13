@@ -15,7 +15,7 @@ namespace Eve
             {
                 Console.WriteLine("Usage:");
                 Console.WriteLine("  eve train <audio_dir> <output_model> [--resume <checkpoint>]");
-                Console.WriteLine("  eve generate <model> <prompt_audio> <output_audio> [num_frames] [temperature]");
+                Console.WriteLine("  eve generate <model> <voice_sample> <prompt_audio> <output_audio> [num_frames] [temperature]");
                 return;
             }
 
@@ -41,14 +41,14 @@ namespace Eve
                     break;
 
                 case "generate":
-                    if (args.Length < 4)
+                    if (args.Length < 5)
                     {
-                        Console.WriteLine("Usage: eve generate <model> <prompt_audio> <output_audio> [num_frames] [temperature]");
+                        Console.WriteLine("Usage: eve generate <model> <voice_sample> <prompt_audio> <output_audio> [num_frames] [temperature]");
                         return;
                     }
-                    int numFrames = args.Length > 4 ? int.Parse(args[4]) : 100;
-                    float temperature = args.Length > 5 ? float.Parse(args[5]) : 0.8f;
-                    Generate(args[1], args[2], args[3], numFrames, temperature);
+                    int numFrames = args.Length > 5 ? int.Parse(args[5]) : 100;
+                    float temperature = args.Length > 6 ? float.Parse(args[6]) : 0.8f;
+                    Generate(args[1], args[2], args[3], args[4], numFrames, temperature);
                     break;
 
                 default:
@@ -77,6 +77,7 @@ namespace Eve
 
             int numEpochs = 50;
             int checkpointEvery = 5;
+            int voicePromptLen = 64; // # of tokens from the start of the file to use as voice prompt
       float learningRate = 0.0000001f; // Reduced to 1e-7 for stability
 
             // Initialize tokenizer
@@ -115,8 +116,9 @@ namespace Eve
             Console.WriteLine($"Loaded {allTokens.Count} files, total {allTokens.Sum(t => t.Length)} tokens");
             Console.WriteLine("Initializing model...");
             Console.Out.Flush();
+            int voiceEmbedDim = 256;
             using var model = new EveNativeHandle(vocabSize, embedDim, numHeads, numLayers,
-                                                   feedForwardDim, maxSeqLen);
+                                                   feedForwardDim, maxSeqLen, voiceEmbedDim);
             model.SetLearningRate(learningRate);
 
             int startEpoch = 0;
@@ -156,6 +158,11 @@ namespace Eve
 
                 foreach (var tokens in shuffled)
                 {
+                    // Voice prompt: first voicePromptLen tokens of this file
+                    int voiceLen = Math.Min(voicePromptLen, tokens.Length);
+                    var voicePrompt = new int[voiceLen];
+                    Array.Copy(tokens, 0, voicePrompt, 0, voiceLen);
+
                     // Split into chunks of maxSeqLen
                     for (int start = 0; start < tokens.Length - maxSeqLen; start += maxSeqLen / 2)
                     {
@@ -165,7 +172,7 @@ namespace Eve
                         var chunk = new int[chunkLen];
                         Array.Copy(tokens, start, chunk, 0, chunkLen);
 
-                        float loss = model.TrainStep(chunk, chunkLen);
+                        float loss = model.TrainStep(chunk, chunkLen, voicePrompt, voiceLen);
                         epochLoss += loss;
                         epochSteps++;
                         globalStep++;
@@ -209,9 +216,10 @@ namespace Eve
             Console.WriteLine("Training complete.");
         }
 
-       static void Generate(string modelPath, string promptPath, string outputPath,
+       static void Generate(string modelPath, string voicePath, string promptPath, string outputPath,
                             int numFrames, float temperature)
         {
+            Console.WriteLine($"Voice sample: {voicePath}");
             Console.WriteLine($"Generating from prompt: {promptPath}");
 
             // Configuration (must match training)
@@ -227,9 +235,20 @@ namespace Eve
             int numLayers = 4;
             int feedForwardDim = 1024;
             int maxSeqLen = 128;
+            int voiceEmbedDim = 256;
 
             // Initialize tokenizer
             var tokenizer = new AudioTokenizer(sampleRate, windowSize, hopSize, fftSize, topK);
+
+            // Load voice sample
+            var voiceAudio = AudioIO.LoadWav(voicePath);
+            if (voiceAudio.SampleRate != sampleRate)
+            {
+                Console.WriteLine($"Error: voice sample rate {voiceAudio.SampleRate} != {sampleRate}");
+                return;
+            }
+            var voiceTokens = tokenizer.Encode(voiceAudio.Samples);
+            Console.WriteLine($"Voice sample: {voiceAudio.Samples.Length} samples -> {voiceTokens.Length} tokens");
 
             // Load prompt audio
             var promptAudio = AudioIO.LoadWav(promptPath);
@@ -246,7 +265,7 @@ namespace Eve
             // Initialize model
             Console.WriteLine("Loading model...");
             using var model = new EveNativeHandle(vocabSize, embedDim, numHeads, numLayers,
-                                                    feedForwardDim, maxSeqLen);
+                                                    feedForwardDim, maxSeqLen, voiceEmbedDim);
             int loadResult = model.LoadModel(modelPath);
             if (loadResult == 0)
             {
@@ -268,7 +287,8 @@ namespace Eve
             var prompt = new int[promptLen];
             Array.Copy(promptTokens, promptTokens.Length - promptLen, prompt, 0, promptLen);
 
-            int generated = model.Generate(prompt, promptLen, outputTokens, numTokensToGenerate, temperature);
+            int generated = model.Generate(voiceTokens, voiceTokens.Length, prompt, promptLen,
+                                          outputTokens, numTokensToGenerate, temperature);
             Console.WriteLine($"Generated {generated} tokens");
 
             // Combine prompt and generated tokens

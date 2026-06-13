@@ -9,9 +9,9 @@ namespace Eve.Native
         private bool _disposed = false;
 
         public EveNativeHandle(int vocabSize, int embedDim, int numHeads, int numLayers,
-                               int feedForwardDim, int maxSeqLen)
+                               int feedForwardDim, int maxSeqLen, int voiceEmbedDim)
         {
-            _handle = eve_create(vocabSize, embedDim, numHeads, numLayers, feedForwardDim, maxSeqLen);
+            _handle = eve_create(vocabSize, embedDim, numHeads, numLayers, feedForwardDim, maxSeqLen, voiceEmbedDim);
             if (_handle == IntPtr.Zero)
                 throw new Exception("Failed to create native handle");
         }
@@ -26,15 +26,18 @@ namespace Eve.Native
             eve_set_learning_rate(_handle, lr);
         }
 
-        public float TrainStep(int[] tokens, int seqLen)
+        public float TrainStep(int[] tokens, int seqLen, int[] voiceTokens, int voiceLen)
         {
-            return eve_train_step(_handle, tokens, seqLen);
+            return eve_train_step(_handle, tokens, seqLen, voiceTokens, voiceLen);
         }
 
-        public int Generate(int[] promptTokens, int promptLen, int[] outputTokens,
-                           int maxOutputLen, float temperature)
+        public int Generate(int[] voiceTokens, int voiceLen,
+                           int[] promptTokens, int promptLen,
+                           int[] outputTokens, int maxOutputLen, float temperature)
         {
-            return eve_generate(_handle, promptTokens, promptLen, outputTokens, maxOutputLen, temperature);
+            return eve_generate(_handle, voiceTokens, voiceLen,
+                                promptTokens, promptLen,
+                                outputTokens, maxOutputLen, temperature);
         }
 
         public int SaveModel(string path)
@@ -83,7 +86,8 @@ namespace Eve.Native
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr eve_create(int vocabSize, int embedDim, int numHeads,
-                                                int numLayers, int feedForwardDim, int maxSeqLen);
+                                                int numLayers, int feedForwardDim, int maxSeqLen,
+                                                int voiceEmbedDim);
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
         private static extern void eve_destroy(IntPtr handle);
@@ -95,11 +99,15 @@ namespace Eve.Native
         private static extern void eve_set_learning_rate(IntPtr handle, float lr);
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
-        private static extern float eve_train_step(IntPtr handle, int[] tokens, int seqLen);
+        private static extern float eve_train_step(IntPtr handle, int[] tokens, int seqLen,
+                                                  int[] voiceTokens, int voiceLen);
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
-        private static extern int eve_generate(IntPtr handle, int[] promptTokens, int promptLen,
-                                               int[] outputTokens, int maxOutputLen, float temperature);
+        private static extern int eve_generate(IntPtr handle,
+                                               int[] voiceTokens, int voiceLen,
+                                               int[] promptTokens, int promptLen,
+                                               int[] outputTokens, int maxOutputLen,
+                                               float temperature);
 
         [DllImport("eve_native", CallingConvention = CallingConvention.Cdecl)]
         private static extern int eve_save_model(IntPtr handle, string path);
